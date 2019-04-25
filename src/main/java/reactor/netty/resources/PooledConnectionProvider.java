@@ -39,11 +39,13 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.util.AttributeKey;
 import io.netty.util.internal.PlatformDependent;
 import org.reactivestreams.Publisher;
+import org.reactivestreams.Subscription;
+import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
-import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.MonoProcessor;
 import reactor.core.publisher.MonoSink;
+import reactor.core.publisher.Operators;
 import reactor.netty.Connection;
 import reactor.netty.ConnectionObserver;
 import reactor.netty.FutureMono;
@@ -211,8 +213,6 @@ final class PooledConnectionProvider implements ConnectionProvider {
 
 		Mono<PooledRef<PooledConnection>> mono = pool.acquire(Duration.ofMillis(acquireTimeout));
 		mono.subscribe(disposableAcquire);
-
-		sink.onCancel(disposableAcquire);
 	}
 
 	static final Logger log = Loggers.getLogger(PooledConnectionProvider.class);
@@ -446,8 +446,8 @@ final class PooledConnectionProvider implements ConnectionProvider {
 		}
 	}
 
-	final static class DisposableAcquire extends BaseSubscriber<PooledRef<PooledConnection>>
-			implements ConnectionObserver, Runnable {
+	final static class DisposableAcquire
+			implements ConnectionObserver, Runnable, CoreSubscriber<PooledRef<PooledConnection>>, Disposable {
 
 		final MonoSink<Connection>               sink;
 		final InstrumentedPool<PooledConnection> pool;
@@ -456,6 +456,7 @@ final class PooledConnectionProvider implements ConnectionProvider {
 		final long                               acquireTimeout;
 
 		PooledRef<PooledConnection> pooledRef;
+		Subscription subscription;
 
 		DisposableAcquire(MonoSink<Connection> sink,
 				InstrumentedPool<PooledConnection> pool,
@@ -470,7 +471,7 @@ final class PooledConnectionProvider implements ConnectionProvider {
 		}
 
 		@Override
-		protected void hookOnNext(PooledRef<PooledConnection> value) {
+		public void onNext(PooledRef<PooledConnection> value) {
 			pooledRef = value;
 
 			PooledConnection pooledConnection = value.poolable();
@@ -488,8 +489,27 @@ final class PooledConnectionProvider implements ConnectionProvider {
 		}
 
 		@Override
-		protected void hookOnError(Throwable throwable) {
+		public void dispose() {
+			subscription.cancel();
+		}
+
+		@Override
+		public void onError(Throwable throwable) {
 			sink.error(throwable);
+		}
+
+		@Override
+		public void onSubscribe(Subscription s) {
+			if (Operators.validate(subscription, s)) {
+				this.subscription = s;
+				sink.onCancel(this);
+				s.request(Long.MAX_VALUE);
+			}
+		}
+
+		@Override
+		public void onComplete() {
+
 		}
 
 		@Override
