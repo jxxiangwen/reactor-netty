@@ -28,8 +28,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
+import io.netty.channel.ChannelHandler;
+import io.netty.handler.codec.LineBasedFrameDecoder;
 import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.junit.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -49,32 +53,50 @@ public class ChannelOperationsHandlerTest {
 
 	@Test
 	public void publisherSenderOnCompleteFlushInProgress_1() {
-		doTestPublisherSenderOnCompleteFlushInProgress(false);
+		doTestPublisherSenderOnCompleteFlushInProgress(false, null);
 	}
 
 	@Test
 	public void publisherSenderOnCompleteFlushInProgress_2() {
-		doTestPublisherSenderOnCompleteFlushInProgress(true);
+		doTestPublisherSenderOnCompleteFlushInProgress(true, null);
 	}
 
-	private void doTestPublisherSenderOnCompleteFlushInProgress(boolean useScheduler) {
+	@Test
+	public void publisherSenderOnCompleteFlushInProgress_3() {
+		doTestPublisherSenderOnCompleteFlushInProgress(false, new WriteTimeoutHandler(1));
+	}
+
+	@Test
+	public void publisherSenderOnCompleteFlushInProgress_4() {
+		doTestPublisherSenderOnCompleteFlushInProgress(true, new WriteTimeoutHandler(1));
+	}
+
+	private void doTestPublisherSenderOnCompleteFlushInProgress(boolean useScheduler, ChannelHandler handler) {
+		AtomicInteger counter = new AtomicInteger();
 		DisposableServer server =
 				HttpServer.create()
 				          .port(0)
+				          .tcpConfiguration(tcpServer -> tcpServer.doOnConnection(conn -> { conn.addHandler(new LineBasedFrameDecoder(10)); }))
 				          .handle((req, res) ->
 				                  req.receive()
 				                     .asString()
+				                     .doOnNext(s -> counter.incrementAndGet())
 				                     .log("receive")
 				                     .then(res.status(200).sendHeaders().then()))
 				          .wiretap(true)
 				          .bindNow(Duration.ofSeconds(30));
 
-		Flux<String> flux = Flux.range(1, 257).map(count -> count + "");
+		Flux<String> flux = Flux.range(1, 257).map(count -> count + "\n");
 		if (useScheduler) {
 			flux.publishOn(Schedulers.single());
 		}
 		Mono<Integer> code =
 				HttpClient.create()
+				          .tcpConfiguration(tcpClient -> tcpClient.doOnConnected(conn -> {
+				              if (handler != null) {
+				                  conn.addHandlerLast(handler);
+				              }
+				          }))
 				          .port(server.address().getPort())
 				          .wiretap(true)
 				          .post()
@@ -87,6 +109,8 @@ public class ChannelOperationsHandlerTest {
 		            .expectNextMatches(c -> c == 200)
 		            .expectComplete()
 		            .verify(Duration.ofSeconds(30));
+
+		assertThat(counter.get()).isEqualTo(257);
 
 		server.disposeNow();
 	}

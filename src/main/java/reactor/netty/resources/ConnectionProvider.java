@@ -17,15 +17,18 @@
 package reactor.netty.resources;
 
 import java.net.SocketAddress;
+import java.time.Duration;
+import java.util.concurrent.TimeoutException;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.pool.FixedChannelPool;
-import io.netty.channel.pool.SimpleChannelPool;
 import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.ReactorNetty;
+import reactor.pool.PoolBuilder;
 import reactor.util.annotation.NonNull;
+
+import javax.annotation.Nullable;
 
 /**
  * A {@link ConnectionProvider} will produce {@link Connection}
@@ -78,12 +81,31 @@ public interface ConnectionProvider extends Disposable {
 	 * {@link Connection}
 	 */
 	static ConnectionProvider elastic(String name) {
+		return elastic(name, null);
+	}
+
+	/**
+	 * Create a {@link ConnectionProvider} to cache and grow on demand {@link Connection}.
+	 * <p>An elastic {@link ConnectionProvider} will never wait before opening a new
+	 * connection. The reuse window is limited but it cannot starve an undetermined volume
+	 * of clients using it.
+	 *
+	 * @param name the channel pool map name
+	 * @param maxIdleTime the {@link Duration} after which the channel will be closed (resolution: ms),
+	 *                    if {@code NULL} there is no max idle time
+	 *
+	 * @return a new {@link ConnectionProvider} to cache and grow on demand
+	 * {@link Connection}
+	 */
+	static ConnectionProvider elastic(String name, @Nullable Duration maxIdleTime) {
 		return new PooledConnectionProvider(name,
-				(bootstrap, handler, checker) -> new SimpleChannelPool(bootstrap,
-						handler,
-						checker,
-						true,
-						false));
+				(allocator, destroyHandler, evictionPredicate) ->
+				                PoolBuilder.from(allocator)
+				                           .destroyHandler(destroyHandler)
+				                           .evictionPredicate(evictionPredicate
+				                                   .or((poolable, meta) -> maxIdleTime != null &&
+				                                           meta.idleTime() >= maxIdleTime.toMillis()))
+				                           .fifo());
 	}
 
 	/**
@@ -127,31 +149,53 @@ public interface ConnectionProvider extends Disposable {
 	 *
 	 * @param name the connection pool name
 	 * @param maxConnections the maximum number of connections before starting pending
-	 * @param acquireTimeout the maximum time in millis to wait for acquiring
+	 * @param acquireTimeout the maximum time in millis after which a pending acquire
+	 *                          must complete or the {@link TimeoutException} will be thrown.
 	 *
 	 * @return a new {@link ConnectionProvider} to cache and reuse a fixed maximum
 	 * number of {@link Connection}
 	 */
 	static ConnectionProvider fixed(String name, int maxConnections, long acquireTimeout) {
+		return fixed(name, maxConnections, acquireTimeout, null);
+	}
+
+	/**
+	 * Create a new {@link ConnectionProvider} to cache and reuse a fixed maximum
+	 * number of {@link Connection}.
+	 * <p>A Fixed {@link ConnectionProvider} will open up to the given max connection value.
+	 * Further connections will be pending acquisition indefinitely.
+	 *
+	 * @param name the connection pool name
+	 * @param maxConnections the maximum number of connections before starting pending
+	 * @param acquireTimeout the maximum time in millis after which a pending acquire
+	 *                          must complete or the {@link TimeoutException} will be thrown.
+	 * @param maxIdleTime the {@link Duration} after which the channel will be closed (resolution: ms),
+	 *                    if {@code NULL} there is no max idle time
+	 *
+	 * @return a new {@link ConnectionProvider} to cache and reuse a fixed maximum
+	 * number of {@link Connection}
+	 */
+	static ConnectionProvider fixed(String name, int maxConnections, long acquireTimeout, @Nullable Duration maxIdleTime) {
 		if (maxConnections == -1) {
 			return elastic(name);
 		}
 		if (maxConnections <= 0) {
-			throw new IllegalArgumentException("Max Connections value must be strictly " + "positive");
+			throw new IllegalArgumentException("Max Connections value must be strictly positive");
 		}
-		if (acquireTimeout != -1L && acquireTimeout < 0) {
-			throw new IllegalArgumentException("Acquire Timeout value must " + "be " + "positive");
+		if (acquireTimeout < 0) {
+			throw new IllegalArgumentException("Acquire Timeout value must be positive");
 		}
 		return new PooledConnectionProvider(name,
-				(bootstrap, handler, checker) -> new FixedChannelPool(bootstrap,
-						handler,
-						checker,
-						FixedChannelPool.AcquireTimeoutAction.FAIL,
-						acquireTimeout,
-						maxConnections,
-						Integer.MAX_VALUE,
-						true,
-						false),
+				(allocator, destroyHandler, evictionPredicate) ->
+				                PoolBuilder.from(allocator)
+				                           .sizeBetween(0, maxConnections)
+				                           .maxPendingAcquireUnbounded()
+				                           .destroyHandler(destroyHandler)
+				                           .evictionPredicate(evictionPredicate
+				                                   .or((poolable, meta) -> maxIdleTime != null &&
+				                                           meta.idleTime() >= maxIdleTime.toMillis()))
+				                           .fifo(),
+				acquireTimeout,
 				maxConnections);
 	}
 
@@ -168,6 +212,13 @@ public interface ConnectionProvider extends Disposable {
 	default void disposeWhen(@NonNull SocketAddress address) {
 	}
 
+	/**
+	 * Dispose this ConnectionProvider.
+	 * This method is NOT blocking. It is implemented as fire-and-forget.
+	 * Use {@link #disposeLater()} when you need to observe the final
+	 * status of the operation, combined with {@link Mono#block()}
+	 * if you need to synchronously wait for the underlying resources to be disposed.
+	 */
 	@Override
 	default void dispose() {
 		//noop default
@@ -175,12 +226,13 @@ public interface ConnectionProvider extends Disposable {
 	}
 
 	/**
-	 * Returns a Mono that triggers the disposal of underlying resources when subscribed to.
+	 * Returns a Mono that triggers the disposal of the ConnectionProvider when subscribed to.
 	 *
-	 * @return a Mono representing the completion of resources disposal.
+	 * @return a Mono representing the completion of the ConnectionProvider disposal.
 	 **/
 	default Mono<Void> disposeLater() {
-		return Mono.empty(); //noop default
+		//noop default
+		return Mono.empty();
 	}
 
 	/**

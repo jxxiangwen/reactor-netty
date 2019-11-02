@@ -17,18 +17,30 @@ package reactor.netty.http.server;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.Charset;
+import java.security.cert.CertificateException;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
+
+import javax.net.ssl.SSLException;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import org.assertj.core.api.Assertions;
 import org.junit.After;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.DisposableServer;
+import reactor.netty.NettyPipeline;
+import reactor.netty.channel.BootstrapHandlers;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.tcp.TcpClient;
 
@@ -42,7 +54,14 @@ import static org.junit.Assert.fail;
  */
 public class ConnectionInfoTests {
 
+	static SelfSignedCertificate ssc;
+
 	private DisposableServer connection;
+
+	@BeforeClass
+	public static void createSelfSignedCertificate() throws CertificateException {
+		ssc = new SelfSignedCertificate();
+	}
 
 	@Test
 	public void noHeaders() {
@@ -114,7 +133,7 @@ public class ConnectionInfoTests {
 	public void xForwardedForHostAndPort() {
 		testClientRequest(
 				clientRequestHeaders -> {
-                    clientRequestHeaders.add("X-Forwarded-For", "192.168.0.1");
+					clientRequestHeaders.add("X-Forwarded-For", "192.168.0.1");
 					clientRequestHeaders.add("X-Forwarded-Host", "a.example.com");
 					clientRequestHeaders.add("X-Forwarded-Port", "8080");
 				},
@@ -126,7 +145,7 @@ public class ConnectionInfoTests {
 	}
 
 	@Test
-	public void proxyProtocol() throws InterruptedException {
+	public void proxyProtocolOn() throws InterruptedException {
 		String remoteAddress = "202.112.144.236";
 		ArrayBlockingQueue<String> resultQueue = new ArrayBlockingQueue<>(1);
 
@@ -138,7 +157,7 @@ public class ConnectionInfoTests {
 		this.connection =
 				HttpServer.create()
 				          .port(0)
-				          .proxyProtocol(true)
+				          .proxyProtocol(ProxyProtocolSupportType.ON)
 				          .handle((req, res) -> {
 				              try {
 				                  requestConsumer.accept(req);
@@ -174,6 +193,135 @@ public class ConnectionInfoTests {
 		          });
 
 		assertThat(resultQueue.poll(5, TimeUnit.SECONDS)).isEqualTo(remoteAddress);
+
+		//send a http request again to confirm that removeAddress is not changed.
+		ByteBuf httpMsg = clientConn.channel()
+		                            .alloc()
+		                            .buffer();
+		httpMsg.writeCharSequence("GET /test HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+				Charset.defaultCharset());
+		clientConn.channel()
+		          .writeAndFlush(httpMsg)
+		          .addListener(f -> {
+		              if (!f.isSuccess()) {
+		                  fail("Writing proxyProtocolMsg was not successful");
+		              }
+		          });
+
+		assertThat(resultQueue.poll(5, TimeUnit.SECONDS)).isEqualTo(remoteAddress);
+	}
+
+	@Test
+	public void proxyProtocolAuto() throws InterruptedException {
+		String remoteAddress = "202.112.144.236";
+		ArrayBlockingQueue<String> resultQueue = new ArrayBlockingQueue<>(1);
+
+		Consumer<HttpServerRequest> requestConsumer = serverRequest -> {
+			String remoteAddrFromRequest = serverRequest.remoteAddress().getHostString();
+			resultQueue.add(remoteAddrFromRequest);
+		};
+
+		this.connection =
+				HttpServer.create()
+				          .port(0)
+				          .proxyProtocol(ProxyProtocolSupportType.AUTO)
+				          .handle((req, res) -> {
+				              try {
+				                  requestConsumer.accept(req);
+				                  return res.status(200)
+				                            .sendString(Mono.just("OK"));
+				              }
+				              catch (Throwable e) {
+				                  return res.status(500)
+				                            .sendString(Mono.just(e.getMessage()));
+				              }
+				          })
+				          .wiretap(true)
+				          .bindNow();
+
+		Connection clientConn =
+				TcpClient.create()
+				         .port(this.connection.port())
+				         .connectNow();
+
+		ByteBuf proxyProtocolMsg = clientConn.channel()
+		                                     .alloc()
+		                                     .buffer();
+		proxyProtocolMsg.writeCharSequence("PROXY TCP4 " + remoteAddress + " 10.210.12.10 5678 80\r\n",
+				Charset.defaultCharset());
+		proxyProtocolMsg.writeCharSequence("GET /test HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+				Charset.defaultCharset());
+		clientConn.channel()
+		          .writeAndFlush(proxyProtocolMsg)
+		          .addListener(f -> {
+		              if (!f.isSuccess()) {
+		                  fail("Writing proxyProtocolMsg was not successful");
+		              }
+		          });
+
+		assertThat(resultQueue.poll(5, TimeUnit.SECONDS)).isEqualTo(remoteAddress);
+
+		clientConn.disposeNow();
+
+		clientConn =
+				TcpClient.create()
+				          .port(this.connection.port())
+				          .connectNow();
+
+		// Send a http request without proxy protocol in a new connection,
+		// server should support this when proxyProtocol is set to ProxyProtocolSupportType.AUTO
+		ByteBuf httpMsg = clientConn.channel()
+		                            .alloc()
+		                            .buffer();
+		httpMsg.writeCharSequence("GET /test HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+				Charset.defaultCharset());
+		clientConn.channel()
+		          .writeAndFlush(httpMsg)
+		          .addListener(f -> {
+		              if (!f.isSuccess()) {
+		                  fail("Writing proxyProtocolMsg was not successful");
+		              }
+		          });
+
+		assertThat(resultQueue.poll(5, TimeUnit.SECONDS))
+				.containsPattern("^0:0:0:0:0:0:0:1(%\\w*)?|127.0.0.1$");
+	}
+
+	@Test
+	public void https() throws SSLException {
+		SslContext clientSslContext = SslContextBuilder.forClient()
+				.trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+		SslContext serverSslContext = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey()).build();
+
+		testClientRequest(
+				clientRequestHeaders -> {},
+				serverRequest -> Assertions.assertThat(serverRequest.scheme()).isEqualTo("https"),
+				httpClient -> httpClient.secure(ssl -> ssl.sslContext(clientSslContext)),
+				httpServer -> httpServer.secure(ssl -> ssl.sslContext(serverSslContext)),
+				true);
+	}
+
+	// Users may add SslHandler themselves, not by using `httpServer.secure`
+	@Test
+	public void httpsUserAddedSslHandler() throws SSLException {
+		SslContext clientSslContext = SslContextBuilder.forClient()
+				.trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+		SslContext serverSslContext = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey()).build();
+
+		testClientRequest(
+				clientRequestHeaders -> {},
+				serverRequest -> Assertions.assertThat(serverRequest.scheme()).isEqualTo("https"),
+				httpClient -> httpClient.secure(ssl -> ssl.sslContext(clientSslContext)),
+				httpServer -> httpServer.tcpConfiguration(tcpServer -> {
+					tcpServer = tcpServer.bootstrap(serverBootstrap ->
+							BootstrapHandlers.updateConfiguration(serverBootstrap, NettyPipeline.SslHandler, (connectionObserver, channel) -> {
+								SslHandler sslHandler = serverSslContext.newHandler(channel.alloc());
+								channel.pipeline().addFirst(NettyPipeline.SslHandler, sslHandler);
+							}));
+
+					return tcpServer;
+				}),
+				true);
 	}
 
 	@Test
@@ -305,45 +453,70 @@ public class ConnectionInfoTests {
 	}
 
 	@Test
-	public void parseAddressForIpV6WithPortAndBrackets() {
+	public void parseAddressForIpV6WithPortAndBrackets_1() {
 		testParseAddress("[1abc:2abc:3abc::5ABC:6abc]:443", 8080, inetSocketAddress -> {
 			Assertions.assertThat(inetSocketAddress.getHostName()).isEqualTo("1abc:2abc:3abc:0:0:0:5abc:6abc");
 			Assertions.assertThat(inetSocketAddress.getPort()).isEqualTo(443);
 		});
 	}
 
+	@Test
+	public void parseAddressForIpV6WithPortAndBrackets_2() {
+		testParseAddress("[2001:db8:a0b:12f0::1]:dba2", 8080, inetSocketAddress -> {
+			Assertions.assertThat(inetSocketAddress.getHostName()).isEqualTo("2001:db8:a0b:12f0:0:0:0:1");
+			Assertions.assertThat(inetSocketAddress.getPort()).isEqualTo(8080);
+		});
+	}
+
 	private void testClientRequest(Consumer<HttpHeaders> clientRequestHeadersConsumer,
-			Consumer<HttpServerRequest> serverConsumer) {
+			Consumer<HttpServerRequest> serverRequestConsumer) {
+		testClientRequest(clientRequestHeadersConsumer, serverRequestConsumer, Function.identity(), Function.identity(), false);
+	}
+
+	private void testClientRequest(Consumer<HttpHeaders> clientRequestHeadersConsumer,
+			Consumer<HttpServerRequest> serverRequestConsumer,
+			Function<HttpClient, HttpClient> clientConfigFunction,
+			Function<HttpServer, HttpServer> serverConfigFunction,
+			boolean useHttps) {
 
 		this.connection =
-				HttpServer.create()
-				          .forwarded(true)
-				          .port(0)
-				          .handle((req, res) -> {
-				              try {
-				                  serverConsumer.accept(req);
-				                  return res.status(200)
-				                            .sendString(Mono.just("OK"));
-				              }
-				              catch (Throwable e) {
-				                  return res.status(500)
-				                            .sendString(Mono.just(e.getMessage()));
-				              }
-				          })
-				          .wiretap(true)
-				          .bindNow();
+				serverConfigFunction.apply(
+						HttpServer.create()
+						          .forwarded(true)
+						          .port(0)
+						)
+				        .handle((req, res) -> {
+				            try {
+				                serverRequestConsumer.accept(req);
+				                return res.status(200)
+				                          .sendString(Mono.just("OK"));
+				            }
+				            catch (Throwable e) {
+				                return res.status(500)
+				                          .sendString(Mono.just(e.getMessage()));
+				            }
+				        })
+				        .wiretap(true)
+				        .bindNow();
+
+		String uri = "/test";
+		if (useHttps) {
+			uri += ("https://localhost:" + this.connection.address().getPort());
+		}
 
 		String response =
-				HttpClient.create()
-				          .port(this.connection.address().getPort())
-				          .wiretap(true)
-				          .headers(clientRequestHeadersConsumer)
-				          .get()
-				          .uri("/test")
-				          .responseContent()
-				          .aggregate()
-				          .asString()
-				          .block();
+				clientConfigFunction.apply(
+						HttpClient.create()
+						          .port(this.connection.address().getPort())
+						          .wiretap(true)
+						)
+				        .headers(clientRequestHeadersConsumer)
+				        .get()
+				        .uri(uri)
+				        .responseContent()
+				        .aggregate()
+				        .asString()
+				        .block();
 
 		assertThat(response).isEqualTo("OK");
 	}
@@ -354,8 +527,9 @@ public class ConnectionInfoTests {
 
 	@After
 	public void tearDown() {
-		if(null != this.connection)
+		if(null != this.connection) {
 			this.connection.disposeNow();
+		}
 	}
 
 }

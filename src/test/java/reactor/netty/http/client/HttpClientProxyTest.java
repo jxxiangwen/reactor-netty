@@ -15,6 +15,8 @@
  */
 package reactor.netty.http.client;
 
+import io.netty.channel.ChannelHandler;
+import io.netty.handler.codec.http.HttpHeaders;
 import io.specto.hoverfly.junit.core.HoverflyConfig;
 import io.specto.hoverfly.junit.rule.HoverflyRule;
 import org.junit.After;
@@ -23,12 +25,16 @@ import org.junit.ClassRule;
 import org.junit.Test;
 import reactor.core.publisher.Mono;
 import reactor.netty.DisposableServer;
-import reactor.netty.SocketUtils;
+import reactor.netty.NettyPipeline;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.tcp.ProxyProvider;
 import reactor.test.StepVerifier;
+import reactor.util.function.Tuple2;
 
+import java.net.SocketAddress;
 import java.time.Duration;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 import static io.specto.hoverfly.junit.core.SimulationSource.dsl;
 import static io.specto.hoverfly.junit.dsl.HoverflyDsl.service;
@@ -39,20 +45,14 @@ import static io.specto.hoverfly.junit.dsl.ResponseCreators.success;
  */
 public class HttpClientProxyTest {
 
-	private static final int port = SocketUtils.findAvailableTcpPort();
-
 	@ClassRule
 	public static final HoverflyRule hoverflyRule =
 			HoverflyRule.inSimulationMode(
-					dsl(service("http://127.0.0.1:" + port)
-					        .get("/")
-					        .willReturn(success()
-					                .body("test")
-					                .header("Hoverfly", "Was-Here"))),
 					HoverflyConfig.localConfigs()
 					              .plainHttpTunneling());
 
 	private DisposableServer server;
+	private int port;
 
 	@Before
 	public void setUp() {
@@ -62,28 +62,36 @@ public class HttpClientProxyTest {
 		                   .handle((req, res) -> res.sendString(Mono.just("test")))
 		                   .wiretap(true)
 		                   .bindNow();
+
+		port = server.port();
+
+		hoverflyRule.simulate(
+				dsl(service("http://127.0.0.1:" + port)
+				        .get("/")
+				        .willReturn(success()
+				                .body("test")
+				                .header("Hoverfly", "Was-Here"))));
 	}
 
 	@After
 	public void tearDown() {
-		server.dispose();
+		if (server != null) {
+			server.disposeNow();
+		}
 	}
 
 	@Test
 	public void proxy_1() {
 		StepVerifier.create(
-				HttpClient.create()
-				          .tcpConfiguration(tcpClient -> tcpClient.proxy(ops -> ops.type(ProxyProvider.Proxy.HTTP)
-				                                                                   .host("localhost")
-				                                                                   .port(hoverflyRule.getProxyPort())))
-				          .addressSupplier(server::address)
-				          .wiretap(true)
-				          .get()
-				          .uri("/")
-				          .responseSingle((response, body) -> Mono.zip(body.asString(),
-				                  Mono.just(response.responseHeaders()))))
+				sendRequest(ops -> ops.type(ProxyProvider.Proxy.HTTP)
+				                      .host("localhost")
+				                      .port(hoverflyRule.getProxyPort()),
+				            server::address,
+				            "/",
+				            true))
 				    .expectNextMatches(t ->
 				            t.getT2().contains("Hoverfly") &&
+				                "FOUND".equals(t.getT2().get("Logging-Handler")) &&
 				                "test".equals(t.getT1()))
 				    .expectComplete()
 				    .verify(Duration.ofSeconds(30));
@@ -92,17 +100,15 @@ public class HttpClientProxyTest {
 	@Test
 	public void proxy_2() {
 		StepVerifier.create(
-				HttpClient.create()
-				          .tcpConfiguration(tcpClient -> tcpClient.proxy(ops -> ops.type(ProxyProvider.Proxy.HTTP)
-				                                                                   .host("localhost")
-				                                                                   .port(hoverflyRule.getProxyPort())))
-				          .wiretap(true)
-				          .get()
-				          .uri("http://127.0.0.1:" + port + "/")
-				          .responseSingle((response, body) -> Mono.zip(body.asString(),
-				                  Mono.just(response.responseHeaders()))))
+				sendRequest(ops -> ops.type(ProxyProvider.Proxy.HTTP)
+				                      .host("localhost")
+				                      .port(hoverflyRule.getProxyPort()),
+				            null,
+				            "http://127.0.0.1:" + port + "/",
+				            true))
 				    .expectNextMatches(t ->
 				            t.getT2().contains("Hoverfly") &&
+				                "FOUND".equals(t.getT2().get("Logging-Handler")) &&
 				                "test".equals(t.getT1()))
 				    .expectComplete()
 				    .verify(Duration.ofSeconds(30));
@@ -111,17 +117,13 @@ public class HttpClientProxyTest {
 	@Test
 	public void nonProxyHosts_1() {
 		StepVerifier.create(
-				HttpClient.create()
-				          .tcpConfiguration(tcpClient -> tcpClient.proxy(ops -> ops.type(ProxyProvider.Proxy.HTTP)
-				                                                                   .host("localhost")
-				                                                                   .port(hoverflyRule.getProxyPort())
-				                                                                   .nonProxyHosts("127.0.0.1")))
-				          .addressSupplier(server::address)
-				          .wiretap(true)
-				          .get()
-				          .uri("/")
-				          .responseSingle((response, body) -> Mono.zip(body.asString(),
-				                  Mono.just(response.responseHeaders()))))
+				sendRequest(ops -> ops.type(ProxyProvider.Proxy.HTTP)
+				                      .host("localhost")
+				                      .port(hoverflyRule.getProxyPort())
+				                      .nonProxyHosts("127.0.0.1"),
+				            server::address,
+				            "/",
+				            true))
 				    .expectNextMatches(t ->
 				            !t.getT2().contains("Hoverfly") &&
 				                "test".equals(t.getT1()))
@@ -132,20 +134,59 @@ public class HttpClientProxyTest {
 	@Test
 	public void nonProxyHosts_2() {
 		StepVerifier.create(
-				HttpClient.create()
-				          .tcpConfiguration(tcpClient -> tcpClient.proxy(ops -> ops.type(ProxyProvider.Proxy.HTTP)
-				                                                                   .host("localhost")
-				                                                                   .port(hoverflyRule.getProxyPort())
-				                                                                   .nonProxyHosts("localhost")))
-				          .wiretap(true)
-				          .get()
-				          .uri("http://localhost:" + port + "/")
-				          .responseSingle((response, body) -> Mono.zip(body.asString(),
-				                  Mono.just(response.responseHeaders()))))
+				sendRequest(ops -> ops.type(ProxyProvider.Proxy.HTTP)
+				                      .host("localhost")
+				                      .port(hoverflyRule.getProxyPort())
+				                      .nonProxyHosts("localhost"),
+				            null,
+				             "http://localhost:" + port + "/",
+				             true))
 				    .expectNextMatches(t ->
 				            !t.getT2().contains("Hoverfly") &&
 				                "test".equals(t.getT1()))
 				    .expectComplete()
 				    .verify(Duration.ofSeconds(30));
+	}
+
+	@Test
+	public void testIssue804() {
+		StepVerifier.create(
+				sendRequest(ops -> ops.type(ProxyProvider.Proxy.HTTP)
+				                      .host("localhost")
+				                      .port(hoverflyRule.getProxyPort()),
+				            server::address,
+				            "/",
+				            false))
+				    .expectNextMatches(t ->
+				           t.getT2().contains("Hoverfly") &&
+				                "NOT FOUND".equals(t.getT2().get("Logging-Handler")) &&
+				                "test".equals(t.getT1()))
+				    .expectComplete()
+				    .verify(Duration.ofSeconds(30));
+	}
+
+	private Mono<Tuple2<String, HttpHeaders>> sendRequest(
+			Consumer<? super ProxyProvider.TypeSpec> proxyOptions,
+			Supplier<? extends SocketAddress> connectAddressSupplier,
+			String uri,
+			boolean wiretap) {
+		HttpClient client =
+				HttpClient.create()
+				          .tcpConfiguration(tcpClient -> tcpClient.proxy(proxyOptions))
+				          .doOnResponse((res, conn) -> {
+				              ChannelHandler handler = conn.channel().pipeline().get(NettyPipeline.ProxyLoggingHandler);
+				              res.responseHeaders()
+				                 .add("Logging-Handler", handler != null? "FOUND" : "NOT FOUND");
+				          });
+
+		if (connectAddressSupplier != null) {
+			client = client.addressSupplier(server::address);
+		}
+
+		return client.wiretap(wiretap)
+		             .get()
+		             .uri(uri)
+		             .responseSingle((response, body) -> Mono.zip(body.asString(),
+		                                                          Mono.just(response.responseHeaders())));
 	}
 }

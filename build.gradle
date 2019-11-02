@@ -29,6 +29,7 @@ buildscript {
 plugins {
   id "com.github.hierynomus.license" version "0.14.0"
   id 'org.asciidoctor.convert' version '1.5.11'
+  id 'com.github.johnrengelman.shadow' version '5.0.0'
 }
 
 description = 'Reactive Streams Netty driver'
@@ -46,8 +47,12 @@ ext {
 
   gradleScriptDir = "${rootProject.projectDir}/gradle"
 
-  reactorCoreVersion = "3.3.0.BUILD-SNAPSHOT"
-  blockHoundVersion = "1.0.0.BUILD-SNAPSHOT"
+  reactorCoreVersion = "3.3.1.BUILD-SNAPSHOT"
+  reactorPoolVersion = "0.1.0.RELEASE"
+  blockHoundVersion = "1.0.1.RELEASE"
+
+  //Metrics
+  micrometerVersion = '1.3.0' //optional baseline: technically could work with 1.2.x, should work with any 1.3.x
 
   // Logging
   slf4jVersion = '1.7.12'
@@ -55,8 +60,17 @@ ext {
   testAddonVersion = reactorCoreVersion
   assertJVersion = '3.6.1'
 
+  // Netty
+  nettyDefaultVersion = '4.1.43.Final'
+  if (!project.hasProperty("forceNettyVersion")) {
+	nettyVersion = nettyDefaultVersion
+  }
+  else {
+	nettyVersion = forceNettyVersion
+	println "Netty version defined from command line: ${forceNettyVersion}"
+  }
+
   // Libraries
-  nettyVersion = '4.1.36.Final'
   jacksonDatabindVersion = '2.5.1'
 
   // Testing
@@ -66,7 +80,7 @@ ext {
   javadocLinks = ["https://docs.oracle.com/javase/7/docs/api/",
 				  "https://docs.oracle.com/javaee/6/api/",
 				  "https://fasterxml.github.io/jackson-databind/javadoc/2.5/",
-				  "https://www.reactive-streams.org/reactive-streams-1.0.2-javadoc/",
+				  "https://www.reactive-streams.org/reactive-streams-1.0.3-javadoc/",
 				  "https://projectreactor.io/docs/core/release/api/",
 				  "https://netty.io/4.1/api/",
 				  "https://projectreactor.io/docs/netty/release/api/",] as String[]
@@ -98,6 +112,10 @@ configure(rootProject) { project ->
 
   ext.bundleImportPackages = [ '!javax.annotation',
 							   'io.netty.channel.kqueue;resolution:=optional;version="[4.1,5)"',
+							   'io.netty.handler.codec.haproxy;resolution:=optional;version="[4.1,5)"',
+							   '!reactor.pool',
+							   'io.micrometer.*;resolution:=optional',
+							   'reactor.blockhound.*;resolution:=optional',
 							   '*']
 
   [compileJava, compileTestJava]*.options*.compilerArgs = ["-Xlint:varargs",
@@ -181,7 +199,13 @@ configure(rootProject) { project ->
 	}
   }
 
-  repositories {
+	sourceSets {
+		jarFileTest
+	}
+
+	idea.module.testSourceDirs += sourceSets.jarFileTest.allSource.srcDirs
+
+	repositories {
 	mavenCentral()
 	if (version.endsWith('BUILD-SNAPSHOT') || project.hasProperty('platformVersion')) {
 	  if (System.getenv ()["bamboo_buildNumber"] == null) {
@@ -190,6 +214,7 @@ configure(rootProject) { project ->
 		println 'Bamboo CI detected, avoiding use of mavenLocal()'
 	  }
 	  maven { url 'https://repo.spring.io/libs-snapshot' }
+	  maven { url 'https://oss.sonatype.org/content/repositories/snapshots' }
 	}
 	maven { url 'https://repo.spring.io/libs-milestone' }
 	maven { url 'https://repo.spring.io/libs-release' }
@@ -202,6 +227,10 @@ configure(rootProject) { project ->
 		os_suffix = ":" + osdetector.classifier
 	}
 
+	configurations {
+		shaded
+	}
+
 	// dependencies that are common across all java projects
   dependencies {
 	// JSR-305 annotations
@@ -211,16 +240,46 @@ configure(rootProject) { project ->
 	compile "io.netty:netty-codec-http2:${nettyVersion}"
 	optional "io.netty:netty-codec-haproxy:${nettyVersion}"
 
+	//Metrics
+	optional "io.micrometer:micrometer-core:${micrometerVersion}"
+
 	// Logging
 	optional "org.slf4j:slf4j-api:$slf4jVersion"
 
 	compile "io.projectreactor:reactor-core:$reactorCoreVersion"
+	shaded("io.projectreactor.addons:reactor-pool:$reactorPoolVersion") {
+		exclude module: "reactor-core"
+	}
 	optional "io.projectreactor.tools:blockhound:$blockHoundVersion"
 
 	compile "io.netty:netty-handler:${nettyVersion}"
 	compile "io.netty:netty-codec-http:${nettyVersion}"
-	compile "io.netty:netty-transport-native-epoll:${nettyVersion}:linux-x86_64"
-	optional "io.netty:netty-transport-native-kqueue:${nettyVersion}"
+
+	//transport resolution: typical build forces epoll but not kqueue transitively
+	//on the other hand, if we want to make transport-specific tests, we'll make all
+	// native optional at compile time and add correct native/nio to testRuntime
+	if (project.hasProperty("forceTransport")) {
+	  //so that the main code compiles
+	  optional "io.netty:netty-transport-native-epoll:${nettyVersion}"
+	  optional "io.netty:netty-transport-native-kqueue:${nettyVersion}"
+	  //now we explicitly add correctly qualified native, or do nothing if we want to test NIO
+	  if (forceTransport == "native") {
+		if (osdetector.os == "osx") {
+		  testRuntime "io.netty:netty-transport-native-kqueue:${nettyVersion}${os_suffix}"
+		}
+		else if (osdetector.os == "linux") {
+		  testRuntime "io.netty:netty-transport-native-epoll:${nettyVersion}${os_suffix}"
+		}
+	  }
+	  else if (forceTransport != "nio") {
+		throw new InvalidUserDataException("invalid -PforceTranport option " + forceTransport + ", should be native|nio")
+	  }
+	}
+	else {
+	  //classic build to be distributed
+	  compile "io.netty:netty-transport-native-epoll:${nettyVersion}:linux-x86_64"
+	  optional "io.netty:netty-transport-native-kqueue:${nettyVersion}"
+	}
 
 	// Testing
 	testCompile "com.fasterxml.jackson.core:jackson-databind:$jacksonDatabindVersion"
@@ -235,7 +294,14 @@ configure(rootProject) { project ->
 	testRuntime "ch.qos.logback:logback-classic:$logbackVersion"
 
 	// Needed for HTTP/2 testing
-	testRuntime "io.netty:netty-tcnative-boringssl-static:2.0.25.Final" + os_suffix
+	testRuntime "io.netty:netty-tcnative-boringssl-static:2.0.26.Final" + os_suffix
+
+	jarFileTestCompile 'org.assertj:assertj-core:3.12.2'
+	jarFileTestCompile 'junit:junit:4.12'
+
+	for (dependency in project.configurations.shaded.dependencies) {
+	    compileOnly(dependency)
+	}
   }
 
 
@@ -257,6 +323,8 @@ configure(rootProject) { project ->
 
 
   jar {
+	classifier = 'original'
+
 	manifest {
 	  instruction 'Import-Package', bundleImportPackages.join(',')
 	  attributes("Created-By": "${System.getProperty("java.version")} (${System.getProperty("java.specification.vendor")})",
@@ -267,6 +335,80 @@ configure(rootProject) { project ->
   }
 
   check.dependsOn jacocoTestReport
+
+  shadowJar {
+	  classifier = null
+
+	  dependsOn(project.tasks.jar)
+
+	  manifest {
+		  inheritFrom project.tasks.jar.manifest
+	  }
+
+	  configurations = [project.configurations.shaded]
+
+	  project.afterEvaluate {
+		  dependencies {
+			  def shadedDependencies = project.configurations
+					  .shaded
+					  .dependencies
+					  .collect { "${it.group}:${it.name}".toString() }
+					  .toSet()
+
+			  // Exclude every compile-scoped dependency (including the transitive ones)
+			  for (id in project.configurations.compile.resolvedConfiguration.resolvedArtifacts*.moduleVersion*.id) {
+				  def module = "${id.group}:${id.name}".toString()
+				  if (!shadedDependencies.contains(module)) {
+					  project.configurations.shaded.exclude(group: id.group, module: id.name)
+					  exclude(dependency(module))
+				  }
+			  }
+		  }
+	  }
+
+	  exclude 'META-INF/maven*/**'
+  }
+
+  task relocateShadowJar(type: com.github.jengelman.gradle.plugins.shadow.tasks.ConfigureShadowRelocation) {
+	  target = tasks.shadowJar
+	  prefix = "reactor.netty.internal.shaded"
+  }
+
+  tasks.shadowJar.dependsOn tasks.relocateShadowJar
+
+  artifacts.archives shadowJar
+
+  task jarFileTest(type: Test) {
+	  testClassesDirs = sourceSets.jarFileTest.output.classesDirs
+	  classpath = sourceSets.jarFileTest.runtimeClasspath
+
+	  systemProperty("jarFile", shadowJar.outputs.files.singleFile)
+
+	  dependsOn(shadowJar)
+  }
+  project.tasks.check.dependsOn(jarFileTest)
+
+  project.tasks.compileTestJava.classpath += configurations.shaded
+  project.tasks.test.classpath += configurations.shaded
+
+  task shadedJarTest(type: Test) {
+	  testClassesDirs = sourceSets.test.output.classesDirs
+
+	  Set<? super File> mainOutputs = [
+			  project.sourceSets.main.output.resourcesDir,
+			  project.sourceSets.main.java.outputDir,
+	  ]
+
+	  classpath = shadowJar.outputs.files
+	  // Exclude main outputs since we have the shaded JAR on the classpath already
+	  classpath += sourceSets.test.runtimeClasspath.filter { !(it in mainOutputs) }
+
+	  //The imports are not relocated, we do relocation only for the main sources not the tests
+	  exclude '**/*PooledConnectionProviderTest*.*'
+
+	  dependsOn(shadowJar)
+  }
+  project.tasks.check.dependsOn(shadedJarTest)
 }
 
 configurations.all {

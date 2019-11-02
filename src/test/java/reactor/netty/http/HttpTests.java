@@ -76,7 +76,7 @@ public class HttpTests {
 
 		StepVerifier.create(content)
 				    .expectComplete()
-				    .verify(Duration.ofSeconds(5000));
+				    .verify(Duration.ofSeconds(30));
 
 		server.disposeNow();
 	}
@@ -366,7 +366,6 @@ public class HttpTests {
 				                       .get("/stream", (req, res) ->
 						                           req.receive()
 						                              .then(res.compression(true)
-						                                       .options(NettyPipeline.SendOptions::flushOnEach)
 						                                       .sendString(ep.log()).then())))
 				          .wiretap(true)
 				          .bindNow();
@@ -440,8 +439,7 @@ public class HttpTests {
 				                                                                  .sendString(Flux.just("test")).then()))
 				                       .get("/stream", (req, res) ->
 						                           req.receive()
-						                              .then(res.options(NettyPipeline.SendOptions::flushOnEach)
-						                                       .sendString(ep.log()).then())))
+						                              .then(res.sendString(ep.log()).then())))
 				          .wiretap(true)
 				          .bindNow();
 

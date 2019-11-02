@@ -289,11 +289,12 @@ public class HttpSendFileTests {
 	}
 
 	@Test
+	@SuppressWarnings("FutureReturnValueIgnored")
 	public void sendFileAsync4096Negative() throws IOException, URISyntaxException {
 		doTestSendFileAsync((req, resp) -> req.receive()
 				                              .take(10)
 				                              .doOnComplete(() -> resp.withConnection(c -> c.channel()
-				                                                                            .close()))
+				                                                                            .close())) //"FutureReturnValueIgnored" this is deliberate
 				                              .then(),
 				4096, "error".getBytes(Charset.defaultCharset()));
 	}

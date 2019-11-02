@@ -16,6 +16,8 @@
 
 package reactor.netty.http.server;
 
+import java.net.InetSocketAddress;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.function.BiPredicate;
 import javax.annotation.Nullable;
@@ -25,7 +27,9 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.DecoderResult;
+import io.netty.handler.codec.DecoderResultProvider;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -38,6 +42,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
 import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.util.ReferenceCountUtil;
 import reactor.core.Exceptions;
 import reactor.netty.Connection;
@@ -57,7 +62,8 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 	static final String MULTIPART_PREFIX = "multipart";
 
 	final ConnectionObserver                                 listener;
-	final boolean                                            secure;
+	Boolean                                                  secure;
+	InetSocketAddress                                        remoteAddress;
 	final boolean                                            readForwardHeaders;
 	final BiPredicate<HttpServerRequest, HttpServerResponse> compress;
 	final ServerCookieEncoder                                cookieEncoder;
@@ -76,11 +82,10 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 
 	HttpTrafficHandler(ConnectionObserver listener, boolean readForwardHeaders,
 			@Nullable BiPredicate<HttpServerRequest, HttpServerResponse> compress,
-			ServerCookieEncoder encoder, ServerCookieDecoder decoder, boolean secure) {
+			ServerCookieEncoder encoder, ServerCookieDecoder decoder) {
 		this.listener = listener;
 		this.readForwardHeaders = readForwardHeaders;
 		this.compress = compress;
-		this.secure = secure;
 		this.cookieEncoder = encoder;
 		this.cookieDecoder = decoder;
 	}
@@ -97,29 +102,17 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 
 	@Override
 	public void channelRead(ChannelHandlerContext ctx, Object msg) {
+		if (secure == null) {
+			secure = ctx.channel().pipeline().get(SslHandler.class) != null;
+		}
+		if (remoteAddress == null) {
+			remoteAddress =
+					Optional.ofNullable(HAProxyMessageReader.resolveRemoteAddressFromProxyProtocol(ctx.channel()))
+					        .orElse(((SocketChannel) ctx.channel()).remoteAddress());
+		}
 		// read message and track if it was keepAlive
 		if (msg instanceof HttpRequest) {
 			final HttpRequest request = (HttpRequest) msg;
-
-			DecoderResult decoderResult = request.decoderResult();
-			if (decoderResult.isFailure()) {
-				Throwable cause = decoderResult.cause();
-				if (HttpServerOperations.log.isDebugEnabled()) {
-					HttpServerOperations.log.debug(format(ctx.channel(), "Decoding failed: " + msg + " : "),
-							cause);
-				}
-				ReferenceCountUtil.release(msg);
-
-				HttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_0,
-				        cause instanceof TooLongFrameException ? HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE:
-				                                                 HttpResponseStatus.BAD_REQUEST);
-				response.headers()
-				        .setInt(HttpHeaderNames.CONTENT_LENGTH, 0)
-				        .set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
-				ctx.writeAndFlush(response)
-				   .addListener(ChannelFutureListener.CLOSE);
-				return;
-			}
 
 			if (persistentConnection) {
 				pendingResponses += 1;
@@ -151,10 +144,22 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 			else {
 				overflow = false;
 
+				DecoderResult decoderResult = request.decoderResult();
+				if (decoderResult.isFailure()) {
+					sendDecodingFailures(decoderResult.cause(), msg);
+					return;
+				}
+
 				HttpServerOperations ops = new HttpServerOperations(Connection.from(ctx.channel()),
 						listener,
-						compress, request, ConnectionInfo.from(ctx.channel(), readForwardHeaders, request, secure),
-						cookieEncoder, cookieDecoder);
+						compress, request,
+						ConnectionInfo.from(ctx.channel(),
+						                    readForwardHeaders,
+						                    request,
+						                    secure,
+						                    remoteAddress),
+						cookieEncoder,
+						cookieDecoder);
 				ops.bind();
 				listener.onStateChange(ops, ConnectionObserver.State.CONFIGURED);
 
@@ -165,6 +170,12 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 		}
 		else if (persistentConnection && pendingResponses == 0) {
 			if (msg instanceof LastHttpContent) {
+				DecoderResult decoderResult = ((LastHttpContent) msg).decoderResult();
+				if (decoderResult.isFailure()) {
+					sendDecodingFailures(decoderResult.cause(), msg);
+					return;
+				}
+
 				ctx.fireChannelRead(msg);
 			}
 			else {
@@ -187,7 +198,35 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 			doPipeline(ctx, msg);
 			return;
 		}
+
+		if (msg instanceof DecoderResultProvider) {
+			DecoderResult decoderResult = ((DecoderResultProvider) msg).decoderResult();
+			if (decoderResult.isFailure()) {
+				sendDecodingFailures(decoderResult.cause(), msg);
+				return;
+			}
+		}
+
 		ctx.fireChannelRead(msg);
+	}
+
+	void sendDecodingFailures(Throwable cause, Object msg) {
+		if (HttpServerOperations.log.isDebugEnabled()) {
+			HttpServerOperations.log.debug(format(ctx.channel(), "Decoding failed: " + msg + " : "), cause);
+		}
+
+		persistentConnection = false;
+
+		ReferenceCountUtil.release(msg);
+
+		HttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_0,
+				cause instanceof TooLongFrameException ? HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE:
+				                                         HttpResponseStatus.BAD_REQUEST);
+		response.headers()
+		        .setInt(HttpHeaderNames.CONTENT_LENGTH, 0)
+		        .set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
+		ctx.writeAndFlush(response)
+		   .addListener(ChannelFutureListener.CLOSE);
 	}
 
 	void doPipeline(ChannelHandlerContext ctx, Object msg) {
@@ -201,6 +240,7 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 	}
 
 	@Override
+	@SuppressWarnings("FutureReturnValueIgnored")
 	public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
 		// modify message on way out to add headers if needed
 		if (msg instanceof HttpResponse) {
@@ -218,6 +258,7 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 			}
 
 			if (response.status().equals(HttpResponseStatus.CONTINUE)) {
+				//"FutureReturnValueIgnored" this is deliberate
 				ctx.write(msg, promise);
 				return;
 			}
@@ -265,6 +306,7 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 			}
 			return;
 		}
+		//"FutureReturnValueIgnored" this is deliberate
 		ctx.write(msg, promise);
 	}
 
@@ -281,13 +323,27 @@ final class HttpTrafficHandler extends ChannelDuplexHandler
 					discard();
 					return;
 				}
-				nextRequest = (HttpRequest)next;
+
+				nextRequest = (HttpRequest) next;
+
+				DecoderResult decoderResult = nextRequest.decoderResult();
+				if (decoderResult.isFailure()) {
+					sendDecodingFailures(decoderResult.cause(), nextRequest);
+					discard();
+					return;
+				}
+
 				HttpServerOperations ops = new HttpServerOperations(Connection.from(ctx.channel()),
 						listener,
 						compress,
 						nextRequest,
-						ConnectionInfo.from(ctx.channel(), readForwardHeaders, nextRequest, secure),
-						cookieEncoder, cookieDecoder);
+						ConnectionInfo.from(ctx.channel(),
+						                    readForwardHeaders,
+						                    nextRequest,
+						                    secure,
+						                    remoteAddress),
+						cookieEncoder,
+						cookieDecoder);
 				ops.bind();
 				listener.onStateChange(ops, ConnectionObserver.State.CONFIGURED);
 			}

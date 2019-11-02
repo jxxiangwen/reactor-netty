@@ -15,6 +15,7 @@
  */
 package reactor.netty.channel;
 
+import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -26,6 +27,9 @@ import javax.annotation.Nullable;
 import io.netty.bootstrap.AbstractBootstrap;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -33,8 +37,10 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.logging.LoggingHandler;
+import io.netty.resolver.AddressResolverGroup;
 import reactor.core.Exceptions;
 import reactor.netty.ConnectionObserver;
+import reactor.netty.Metrics;
 import reactor.netty.NettyPipeline;
 import reactor.netty.ReactorNetty;
 import reactor.util.Logger;
@@ -112,19 +118,22 @@ public abstract class BootstrapHandlers {
 
 
 		if (pipeline != null) {
+			BootstrapPipelineHandler newPipeline = new BootstrapPipelineHandler(pipeline);
 			PipelineConfiguration pipelineConfiguration;
-			for (int i = 0; i < pipeline.size(); i++) {
-				pipelineConfiguration = pipeline.get(i);
+			for (int i = 0; i < newPipeline.size(); i++) {
+				pipelineConfiguration = newPipeline.get(i);
 				if (pipelineConfiguration.deferredConsumer != null) {
-					pipeline.set(i,
+					newPipeline.set(i,
 							new PipelineConfiguration(
 									pipelineConfiguration.deferredConsumer.apply(b),
 									pipelineConfiguration.name));
 				}
 			}
+			b.handler(new BootstrapInitializerHandler(newPipeline, opsFactory, listener));
 		}
-
-		b.handler(new BootstrapInitializerHandler(pipeline, opsFactory, listener));
+		else {
+			b.handler(new BootstrapInitializerHandler(null, opsFactory, listener));
+		}
 	}
 
 	/**
@@ -215,10 +224,10 @@ public abstract class BootstrapHandlers {
 				(ChannelOperations.OnSetup) b.config()
 				                             .options()
 				                             .get(OPS_OPTION);
-		b.option(OPS_OPTION, null);
 		if (ops == null) {
 			return ChannelOperations.OnSetup.empty(); //will not be triggered in
 		}
+		b.option(OPS_OPTION, null);
 		return ops;
 	}
 
@@ -432,6 +441,67 @@ public abstract class BootstrapHandlers {
 		return new LoggingHandlerSupportConsumer(handler, debugSsl);
 	}
 
+	public static ServerBootstrap updateMetricsSupport(ServerBootstrap b, String name, String protocol) {
+		return updateConfiguration(b,
+				NettyPipeline.ChannelMetricsHandler,
+				new MetricsSupportConsumer(name, protocol, true));
+	}
+
+	public static ServerBootstrap updateMetricsSupport(ServerBootstrap b, ChannelMetricsRecorder recorder) {
+		return updateConfiguration(b,
+				NettyPipeline.ChannelMetricsHandler,
+				new MetricsSupportConsumer(recorder, true));
+	}
+
+	@SuppressWarnings("unchecked")
+	public static Bootstrap updateMetricsSupport(Bootstrap b, String name, String protocol) {
+		updateConfiguration(b,
+				NettyPipeline.ChannelMetricsHandler,
+				new DeferredMetricsSupport(name, protocol, false));
+
+		b.resolver(new AddressResolverGroupMetrics((AddressResolverGroup<SocketAddress>) b.config().resolver()));
+
+		return b;
+	}
+
+	@SuppressWarnings("unchecked")
+	public static Bootstrap updateMetricsSupport(Bootstrap b, ChannelMetricsRecorder recorder) {
+		updateConfiguration(b,
+				NettyPipeline.ChannelMetricsHandler,
+				new DeferredMetricsSupport(recorder, false));
+
+		b.resolver(new AddressResolverGroupMetrics((AddressResolverGroup<SocketAddress>) b.config().resolver(), recorder));
+
+		return b;
+	}
+
+	public static ServerBootstrap removeMetricsSupport(ServerBootstrap b) {
+		return removeConfiguration(b, NettyPipeline.ChannelMetricsHandler);
+	}
+
+	public static Bootstrap removeMetricsSupport(Bootstrap b) {
+		removeConfiguration(b, NettyPipeline.ChannelMetricsHandler);
+
+		AddressResolverGroup<?> resolver = b.config().resolver();
+		if (resolver instanceof AddressResolverGroupMetrics) {
+			b.resolver(((AddressResolverGroupMetrics) resolver).resolverGroup);
+		}
+
+		return b;
+	}
+
+	/**
+	 * Find metrics support in the given client bootstrap
+	 *
+	 * @param b a bootstrap to search
+	 *
+	 * @return any {@link BootstrapHandlers.DeferredMetricsSupport} found or null
+	 */
+	@Nullable
+	public static Function<Bootstrap, BiConsumer<ConnectionObserver, Channel>> findMetricsSupport(Bootstrap b) {
+		return BootstrapHandlers.findConfiguration(DeferredMetricsSupport.class, b.config().handler());
+	}
+
 	@ChannelHandler.Sharable
 	static final class BootstrapInitializerHandler extends ChannelInitializer<Channel> {
 
@@ -544,6 +614,7 @@ public abstract class BootstrapHandlers {
 					"BootstrapHandlers.finalizeHandler() call");
 		}
 
+		@SuppressWarnings("deprecation")
 		@Override
 		public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
 			throw Exceptions.propagate(cause);
@@ -582,9 +653,12 @@ public abstract class BootstrapHandlers {
 						handler);
 			}
 			else if (pipeline.get(NettyPipeline.ProxyHandler) != null) {
-				pipeline.addAfter(NettyPipeline.ProxyHandler,
-						NettyPipeline.LoggingHandler,
-						handler);
+				pipeline.addBefore(NettyPipeline.ProxyHandler,
+				                   NettyPipeline.ProxyLoggingHandler,
+				                   new LoggingHandler("reactor.netty.proxy"))
+				        .addAfter(NettyPipeline.ProxyHandler,
+				                  NettyPipeline.LoggingHandler,
+				                  handler);
 			}
 			else {
 				pipeline.addFirst(NettyPipeline.LoggingHandler, handler);
@@ -606,6 +680,131 @@ public abstract class BootstrapHandlers {
 		@Override
 		public int hashCode() {
 			return Objects.hash(handler);
+		}
+	}
+
+
+	static final class DeferredMetricsSupport
+			implements Function<Bootstrap, BiConsumer<ConnectionObserver, Channel>> {
+
+		final String name;
+
+		final String protocol;
+
+		final ChannelMetricsRecorder recorder;
+
+		final boolean onServer;
+
+		DeferredMetricsSupport(String name, String protocol, boolean onServer) {
+			this.name = name;
+			this.protocol = protocol;
+			this.recorder = null;
+			this.onServer = onServer;
+		}
+
+		DeferredMetricsSupport(ChannelMetricsRecorder recorder, boolean onServer) {
+			this.name = null;
+			this.protocol = null;
+			this.recorder = recorder;
+			this.onServer = onServer;
+		}
+
+		@Override
+		public BiConsumer<ConnectionObserver, Channel> apply(Bootstrap bootstrap) {
+			if (recorder != null) {
+				return new MetricsSupportConsumer(recorder, bootstrap.config().remoteAddress(), onServer);
+			}
+			else {
+				return new MetricsSupportConsumer(name, bootstrap.config().remoteAddress(), protocol, onServer);
+			}
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) {
+				return true;
+			}
+			if (o == null || getClass() != o.getClass()) {
+				return false;
+			}
+			DeferredMetricsSupport that = (DeferredMetricsSupport) o;
+			return onServer == that.onServer &&
+					Objects.equals(name, that.name) &&
+					Objects.equals(protocol, that.protocol) &&
+					Objects.equals(recorder, that.recorder);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(name, protocol, recorder, onServer);
+		}
+	}
+
+	static final class MetricsSupportConsumer
+			implements BiConsumer<ConnectionObserver, Channel> {
+
+		final String name;
+
+		final SocketAddress remoteAddress;
+
+		final String protocol;
+
+		final ChannelMetricsRecorder recorder;
+
+		final boolean onServer;
+
+		MetricsSupportConsumer(String name, String protocol, boolean onServer) {
+			this(name, null, protocol, onServer);
+		}
+
+		MetricsSupportConsumer(String name, @Nullable SocketAddress remoteAddress, String protocol, boolean onServer) {
+			this.name = name;
+			this.remoteAddress = remoteAddress;
+			this.protocol = protocol;
+			this.recorder = null;
+			this.onServer = onServer;
+		}
+
+		MetricsSupportConsumer(ChannelMetricsRecorder recorder, boolean onServer) {
+			this(recorder, null, onServer);
+		}
+
+		MetricsSupportConsumer(ChannelMetricsRecorder recorder, @Nullable SocketAddress remoteAddress, boolean onServer) {
+			this.name = null;
+			this.remoteAddress = remoteAddress;
+			this.protocol = null;
+			this.recorder = recorder;
+			this.onServer = onServer;
+		}
+
+		@Override
+		public void accept(ConnectionObserver connectionObserver, Channel channel) {
+			//TODO check all other handlers and add this always as first SSL, Proxy, ProxyProtocol
+			//TODO or after the proxy?
+			SocketAddress address = remoteAddress != null ?  remoteAddress : channel.remoteAddress();
+
+			ChannelMetricsRecorder channelMetricsRecorder = recorder;
+			if (channelMetricsRecorder == null) {
+				channelMetricsRecorder =
+						new MicrometerChannelMetricsRecorder(name, Metrics.formatSocketAddress(address), protocol);
+			}
+
+			channel.pipeline()
+			       .addFirst(NettyPipeline.ChannelMetricsHandler,
+			                 new ChannelMetricsHandler(channelMetricsRecorder,
+			                                           //Check the remote address is it on the proxy or not
+			                                           address,
+			                                           onServer));
+
+			ByteBufAllocator alloc = channel.alloc();
+			if (alloc instanceof PooledByteBufAllocator) {
+				ByteBufAllocatorMetrics.registerMetrics("pooled", alloc.hashCode() + "",
+						((PooledByteBufAllocator) alloc).metric());
+			}
+			else if (alloc instanceof UnpooledByteBufAllocator) {
+				ByteBufAllocatorMetrics.registerMetrics("unpooled", alloc.hashCode() + "",
+						((UnpooledByteBufAllocator) alloc).metric());
+			}
 		}
 	}
 }

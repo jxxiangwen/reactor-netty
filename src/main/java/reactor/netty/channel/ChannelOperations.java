@@ -21,6 +21,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import javax.annotation.Nullable;
 
 import io.netty.buffer.ByteBuf;
@@ -92,8 +93,6 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 	final ConnectionObserver  listener;
 	final MonoProcessor<Void> onTerminate;
 
-	boolean flushOnEach;
-
 	@SuppressWarnings("unchecked")
 	volatile Subscription outboundSubscription;
 
@@ -101,7 +100,6 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 		this.connection = replaced.connection;
 		this.listener = replaced.listener;
 		this.onTerminate = replaced.onTerminate;
-		this.flushOnEach = replaced.flushOnEach;
 		this.inbound = new FluxReceive(this);
 	}
 
@@ -171,7 +169,16 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 
 	@Override
 	public final boolean isDisposed() {
-		return !channel().isActive() || OUTBOUND_CLOSE.get(this) == Operators.cancelledSubscription();
+		return !channel().isActive() || isSubscriptionDisposed();
+	}
+
+	/**
+	 * Return true if dispose subscription has been terminated
+	 *
+	 * @return true if dispose subscription has been terminated
+	 */
+	public final boolean isSubscriptionDisposed() {
+		return OUTBOUND_CLOSE.get(this) == Operators.cancelledSubscription();
 	}
 
 	@Override
@@ -230,22 +237,28 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 
 	@Override
 	@SuppressWarnings("unchecked")
-	public NettyOutbound send(Publisher<? extends ByteBuf> dataStream) {
+	public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+		if (!channel().isActive()) {
+			return then(Mono.error(new AbortedException("Connection has been closed")));
+		}
 		if (dataStream instanceof Mono) {
 			return then(((Mono<?>)dataStream).flatMap(m -> FutureMono.from(channel().writeAndFlush(m)))
 			                                 .doOnDiscard(ByteBuf.class, ByteBuf::release));
 		}
-		return then(MonoSendMany.byteBufSource(dataStream, channel(), flushOnEach));
+		return then(MonoSendMany.byteBufSource(dataStream, channel(), predicate));
 	}
 
 	@Override
 	@SuppressWarnings("unchecked")
-	public NettyOutbound sendObject(Publisher<?> dataStream) {
+	public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
+		if (!channel().isActive()) {
+			return then(Mono.error(new AbortedException("Connection has been closed")));
+		}
 		if (dataStream instanceof Mono) {
 			return then(((Mono<?>)dataStream).flatMap(m -> FutureMono.from(channel().writeAndFlush(m)))
 			                                 .doOnDiscard(ReferenceCounted.class, ReferenceCounted::release));
 		}
-		return then(MonoSendMany.objectSource(dataStream, channel(), flushOnEach));
+		return then(MonoSendMany.objectSource(dataStream, channel(), predicate));
 	}
 
 	@Override
@@ -400,23 +413,6 @@ public class ChannelOperations<INBOUND extends NettyInbound, OUTBOUND extends Ne
 			onTerminate.onComplete();
 			listener.onStateChange(this, ConnectionObserver.State.DISCONNECTING);
 		}
-	}
-
-	@Override
-	public NettyOutbound options(Consumer<? super NettyPipeline.SendOptions> configurator) {
-		configurator.accept(new NettyPipeline.SendOptions() {
-			@Override
-			public NettyPipeline.SendOptions flushOnBoundary() {
-				return this;
-			}
-
-			@Override
-			public NettyPipeline.SendOptions flushOnEach(boolean withEventLoop) {
-				flushOnEach = !withEventLoop;
-				return this;
-			}
-		});
-		return this;
 	}
 
 	/**

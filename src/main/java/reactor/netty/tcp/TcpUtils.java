@@ -50,8 +50,7 @@ final class TcpUtils {
 	}
 
 	static Bootstrap removeProxySupport(Bootstrap b) {
-		BootstrapHandlers.removeConfiguration(b, NettyPipeline.ProxyHandler);
-		return b;
+		return BootstrapHandlers.removeConfiguration(b, NettyPipeline.ProxyHandler);
 	}
 
 	static Bootstrap updateHost(Bootstrap b, String host) {
@@ -110,8 +109,6 @@ final class TcpUtils {
 			return supplier.get();
 		}
 	}
-
-	static final Logger log = Loggers.getLogger(TcpUtils.class);
 
 	static final ChannelOperations.OnSetup TCP_OPS =
 			(ch, c, msg) -> new ChannelOperations<>(ch, c);

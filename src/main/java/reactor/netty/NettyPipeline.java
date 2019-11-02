@@ -20,7 +20,6 @@ import java.util.function.BiConsumer;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandler;
-import org.reactivestreams.Publisher;
 
 /**
  * Constant for names used when adding/removing {@link io.netty.channel.ChannelHandler}.
@@ -54,6 +53,7 @@ public interface NettyPipeline {
 	String SslReader          = LEFT + "sslReader";
 	String SslLoggingHandler  = LEFT + "sslLoggingHandler";
 	String ProxyHandler       = LEFT + "proxyHandler";
+	String ProxyLoggingHandler= LEFT + "proxyLoggingHandler";
 	String ReactiveBridge     = RIGHT + "reactiveBridge";
 	String HttpCodec          = LEFT + "httpCodec";
 	String HttpDecompressor   = LEFT + "decompressor";
@@ -66,46 +66,13 @@ public interface NettyPipeline {
 	String ChunkedWriter      = LEFT + "chunkedWriter";
 	String LoggingHandler     = LEFT + "loggingHandler";
 	String CompressionHandler = LEFT + "compressionHandler";
+	String HttpMetricsHandler = LEFT + "httpMetricsHandler";
+	String SslMetricsHandler  = LEFT + "sslMetricsHandler";
+	String ChannelMetricsHandler = LEFT + "channelMetricsHandler";
+	String ConnectMetricsHandler = LEFT + "connectMetricsHandler";
 	String WsCompressionHandler = LEFT + "wsCompressionHandler";
 	String ProxyProtocolDecoder = LEFT + "proxyProtocolDecoder";
 	String ProxyProtocolReader  = LEFT + "proxyProtocolReader";
-
-	/**
-	 * A builder for sending strategy, similar prefixed methods being mutually exclusive
-	 * (flushXxx, prefetchXxx, requestXxx).
-	 */
-	interface SendOptions {
-
-		/**
-		 * Makes the underlying channel flushes on a terminated {@link Publisher} (default).
-		 *
-		 * @return this {@link SendOptions}
-		 */
-		SendOptions flushOnBoundary();
-
-		/**
-		 * Makes the underlying channel flushes item by item.
-		 * Flush operation will be scheduled and executed at some time in the future.
-		 *
-		 * @return this {@link SendOptions}
-		 */
-		default SendOptions flushOnEach() {
-			return flushOnEach(true);
-		}
-
-		/**
-		 * Makes the underlying channel flushes item by item.
-		 * Whether flush operation is executed immediately after the write operation
-		 * or not is specified by {@code withEventLoop} parameter.
-		 *
-		 * @param withEventLoop flag specifying whether flush operation
-		 *                      will be executed immediately or at some time in the future
-		 * @return this {@link SendOptions}
-		 */
-		SendOptions flushOnEach(boolean withEventLoop);
-
-
-	}
 
 	/**
 	 * Create a new {@link ChannelInboundHandler} that will invoke

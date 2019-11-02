@@ -30,6 +30,7 @@ import java.nio.file.Paths;
 import java.security.cert.CertificateException;
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -42,6 +43,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import javax.net.ssl.SSLException;
 
@@ -49,6 +51,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelId;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
@@ -76,9 +79,9 @@ import reactor.core.publisher.DirectProcessor;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.ByteBufFlux;
+import reactor.netty.ByteBufMono;
 import reactor.netty.DisposableServer;
 import reactor.netty.FutureMono;
-import reactor.netty.NettyPipeline;
 import reactor.netty.SocketUtils;
 import reactor.netty.channel.AbortedException;
 import reactor.netty.http.server.HttpServer;
@@ -783,8 +786,7 @@ public class HttpClientTest {
 		DisposableServer httpServer =
 				HttpServer.create()
 				          .port(0)
-				          .handle((in, out) ->  out.options(NettyPipeline.SendOptions::flushOnEach)
-				                                   .sendString(Mono.just("test")
+				          .handle((in, out) ->  out.sendString(Mono.just("test")
 				                                                   .delayElement(Duration.ofMillis(100))
 				                                                   .repeat()))
 				          .wiretap(true)
@@ -1529,8 +1531,7 @@ public class HttpClientTest {
 				HttpServer.create()
 				          .port(0)
 				          .handle((req, res) ->
-				                  res.options(o -> o.flushOnEach(false))
-				                     .sendString(Flux.range(0, 10)
+				                  res.sendString(Flux.range(0, 10)
 				                                     .map(i -> "test")
 				                                     .delayElements(Duration.ofMillis(4))))
 				          .bindNow();
@@ -1732,5 +1733,153 @@ public class HttpClientTest {
 		            .verify(Duration.ofSeconds(30));
 
 		disposableServer.disposeNow();
+	}
+
+	@Test
+	public void testIssue777() {
+		DisposableServer server = null;
+		try {
+			server = HttpServer.create()
+			                   .port(0)
+			                   .wiretap(true)
+			                   .route(r ->
+			                       r.post("/empty", (req, res) -> res.status(400)
+			                                                               .header(HttpHeaderNames.CONNECTION, "close")
+			                                                               .send(Mono.empty()))
+			                        .post("/test", (req, res) -> res.status(400)
+			                                                              .header(HttpHeaderNames.CONNECTION, "close")
+			                                                              .sendString(Mono.just("Test"))))
+			                   .bindNow();
+
+			HttpClient client = createHttpClientForContextWithAddress(server);
+
+			BiFunction<HttpClientResponse, ByteBufMono, Mono<String>> receiver =
+					(resp, bytes) -> {
+						if (!Objects.equals(HttpResponseStatus.OK, resp.status())) {
+							return bytes.asString()
+							            .switchIfEmpty(Mono.just(resp.status().reasonPhrase()))
+							            .flatMap(text -> Mono.error(new RuntimeException(text)));
+						}
+						return bytes.asString();
+					};
+			doTestIssue777_1(client, "/empty", "Bad Request", receiver);
+			doTestIssue777_1(client, "/test", "Test", receiver);
+
+			receiver = (resp, bytes) -> {
+				if (Objects.equals(HttpResponseStatus.OK, resp.status())) {
+					return bytes.asString();
+				}
+				return Mono.error(new RuntimeException("error"));
+			};
+			doTestIssue777_1(client, "/empty", "error", receiver);
+			doTestIssue777_1(client, "/test", "error", receiver);
+
+			BiFunction<HttpClientResponse, ByteBufMono, Mono<Tuple2<String, HttpClientResponse>>> receiver1 =
+					(resp, byteBuf) ->
+							Mono.zip(byteBuf.asString(StandardCharsets.UTF_8)
+							                .switchIfEmpty(Mono.just(resp.status().reasonPhrase())),
+							         Mono.just(resp));
+			doTestIssue777_2(client, "/empty", "Bad Request", receiver1);
+			doTestIssue777_2(client, "/test", "Test", receiver1);
+
+			receiver =
+					(resp, bytes) -> bytes.asString(StandardCharsets.UTF_8)
+					                      .switchIfEmpty(Mono.just(resp.status().reasonPhrase()))
+					                      .map(respBody -> {
+					                          if (!Objects.equals(HttpResponseStatus.OK, resp.status())) {
+					                              throw new RuntimeException(respBody);
+					                          }
+					                          return respBody;
+					                      });
+			doTestIssue777_1(client, "/empty", "Bad Request", receiver);
+			doTestIssue777_1(client, "/test", "Test", receiver);
+		}
+		finally {
+			if (server != null) {
+				server.disposeNow();
+			}
+		}
+	}
+
+	private void doTestIssue777_1(HttpClient client, String uri, String expectation,
+			BiFunction<? super HttpClientResponse, ? super ByteBufMono, ? extends Mono<String>> receiver) {
+		StepVerifier.create(
+		        client.post()
+		              .uri(uri)
+		              .send((req, out) -> out.sendString(Mono.just("Test")))
+		              .responseSingle(receiver))
+		            .expectErrorMessage(expectation)
+		            .verify(Duration.ofSeconds(30));
+	}
+
+	private void doTestIssue777_2(HttpClient client, String uri, String expectation,
+			BiFunction<? super HttpClientResponse, ? super ByteBufMono, ? extends Mono<Tuple2<String, HttpClientResponse>>> receiver) {
+		StepVerifier.create(
+		        client.post()
+		              .uri(uri)
+		              .send((req, out) -> out.sendString(Mono.just("Test")))
+		              .responseSingle(receiver)
+		              .map(tuple -> {
+		                  if (!Objects.equals(HttpResponseStatus.OK, tuple.getT2().status())) {
+		                      throw new RuntimeException(tuple.getT1());
+		                  }
+		                  return tuple.getT1();
+		              }))
+		            .expectErrorMessage(expectation)
+		            .verify(Duration.ofSeconds(30));
+	}
+
+	@Test
+	public void testConnectionIdleTimeFixedPool() throws Exception {
+		ConnectionProvider provider = ConnectionProvider.fixed("test", 1, 100, Duration.ofMillis(10));
+		ChannelId[] ids = doTestConnectionIdleTime(provider);
+		assertThat(ids[0]).isNotEqualTo(ids[1]);
+	}
+
+	@Test
+	public void testConnectionIdleTimeElasticPool() throws Exception {
+		ConnectionProvider provider = ConnectionProvider.elastic("test", Duration.ofMillis(10));
+		ChannelId[] ids = doTestConnectionIdleTime(provider);
+		assertThat(ids[0]).isNotEqualTo(ids[1]);
+	}
+
+	@Test
+	public void testConnectionNoIdleTimeFixedPool() throws Exception {
+		ConnectionProvider provider = ConnectionProvider.fixed("test", 1, 100);
+		ChannelId[] ids = doTestConnectionIdleTime(provider);
+		assertThat(ids[0]).isEqualTo(ids[1]);
+	}
+
+	@Test
+	public void testConnectionNoIdleTimeElasticPool() throws Exception {
+		ConnectionProvider provider = ConnectionProvider.elastic("test");
+		ChannelId[] ids = doTestConnectionIdleTime(provider);
+		assertThat(ids[0]).isEqualTo(ids[1]);
+	}
+
+	private ChannelId[] doTestConnectionIdleTime(ConnectionProvider provider) throws Exception {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .wiretap(true)
+				          .handle((req, res) -> res.sendString(Mono.just("hello")))
+				          .bindNow();
+
+		Flux<ChannelId> id = createHttpClientForContextWithAddress(server, provider)
+		                       .get()
+		                       .uri("/")
+		                       .responseConnection((res, conn) -> Mono.just(conn.channel().id())
+		                                                              .delayUntil(ch -> conn.inbound().receive()));
+
+		ChannelId id1 = id.blockLast(Duration.ofSeconds(30));
+		Thread.sleep(30);
+		ChannelId id2 = id.blockLast(Duration.ofSeconds(30));
+
+		assertThat(id1).isNotNull();
+		assertThat(id2).isNotNull();
+
+		server.disposeNow();
+		provider.dispose();
+		return new ChannelId[] {id1, id2};
 	}
 }

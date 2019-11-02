@@ -28,6 +28,7 @@ import java.util.function.Function;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import org.reactivestreams.Publisher;
@@ -64,11 +65,9 @@ public class ByteBufFlux extends FluxOperator<ByteBuf, ByteBuf> {
 	 *
 	 * @return a {@link ByteBufFlux}
 	 */
-	public static ByteBufFlux fromInbound(Publisher<?> source,
-			ByteBufAllocator allocator) {
+	public static ByteBufFlux fromInbound(Publisher<?> source, ByteBufAllocator allocator) {
 		Objects.requireNonNull(allocator, "allocator");
-		return maybeFuse(Flux.from(source)
-		                           .map(bytebufExtractor), allocator);
+		return maybeFuse(Flux.from(ReactorNetty.publisherOrScalarMap(source, bytebufExtractor)), allocator);
 	}
 
 
@@ -86,13 +85,12 @@ public class ByteBufFlux extends FluxOperator<ByteBuf, ByteBuf> {
 	public static ByteBufFlux fromString(Publisher<? extends String> source, Charset charset, ByteBufAllocator allocator) {
 		Objects.requireNonNull(allocator, "allocator");
 		return maybeFuse(
-				Flux.from(source)
-				    .map(s -> {
-				        ByteBuf buffer = allocator.buffer();
-				        buffer.writeCharSequence(s, charset);
-				        return buffer;
-				    }),
-				allocator);
+				Flux.from(ReactorNetty.publisherOrScalarMap(
+						source, s -> {
+							ByteBuf buffer = allocator.buffer();
+							buffer.writeCharSequence(s, charset);
+							return buffer;
+						})), allocator);
 	}
 
 	/**
@@ -154,23 +152,27 @@ public class ByteBufFlux extends FluxOperator<ByteBuf, ByteBuf> {
 		if (maxChunkSize < 1) {
 			throw new IllegalArgumentException("chunk size must be strictly positive, " + "was: " + maxChunkSize);
 		}
-		return maybeFuse(Flux.generate(() -> FileChannel.open(path), (fc, sink) -> {
-			ByteBuf buf = allocator.buffer();
-			try {
-				if (buf.writeBytes(fc, maxChunkSize) < 0) {
-					buf.release();
-					sink.complete();
-				}
-				else {
-					sink.next(buf);
-				}
-			}
-			catch (IOException e) {
-				buf.release();
-				sink.error(e);
-			}
-			return fc;
-		}), allocator);
+		return maybeFuse(
+				Flux.generate(() -> FileChannel.open(path),
+				              (fc, sink) -> {
+				                  ByteBuf buf = allocator.buffer();
+				                  try {
+				                      if (buf.writeBytes(fc, maxChunkSize) < 0) {
+				                          buf.release();
+				                          sink.complete();
+				                      }
+				                      else {
+				                          sink.next(buf);
+				                      }
+				                  }
+				                  catch (IOException e) {
+				                      buf.release();
+				                      sink.error(e);
+				                  }
+				                  return fc;
+				              },
+				              ReactorNetty.fileCloser),
+				allocator);
 	}
 
 	/**
@@ -256,23 +258,25 @@ public class ByteBufFlux extends FluxOperator<ByteBuf, ByteBuf> {
 	 * @return {@link ByteBufMono} of aggregated {@link ByteBuf}
 	 */
 	public final ByteBufMono aggregate() {
-		return Mono.using(alloc::compositeBuffer,
-				b -> this.reduce(b,
-				                 (prev, next) -> {
-				                     if (prev.refCnt() > 0) {
-				                         return prev.addComponent(true, next.retain());
-				                     }
-				                     else {
-				                         return prev;
-				                     }
-				                 })
-				         .filter(ByteBuf::isReadable),
-				b -> {
-				    if (b.refCnt() > 0) {
-				        b.release();
-				    }
-				})
-				.as(ByteBufMono::maybeFuse);
+		return Mono.defer(() -> {
+			CompositeByteBuf b = alloc.compositeBuffer();
+			return this.reduce(b,
+			                   (prev, next) -> {
+			                       if (prev.refCnt() > 0) {
+			                           return prev.addComponent(true, next.retain());
+			                       }
+			                       else {
+			                           return prev;
+			                       }
+			                   })
+			           .filter(ByteBuf::isReadable)
+			           .doFinally(signalType -> {
+			               if (b.refCnt() > 0) {
+			                   b.release();
+			               }
+			           });
+			})
+			.as(ByteBufMono::maybeFuse);
 	}
 
 	/**

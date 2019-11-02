@@ -55,6 +55,7 @@ import reactor.netty.http.websocket.WebsocketOutbound;
 import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.tcp.SslProvider;
 import reactor.netty.tcp.TcpClient;
+import reactor.util.Metrics;
 
 /**
  * An HttpClient allows to build in a safe immutable way an http client that is
@@ -640,10 +641,10 @@ public abstract class HttpClient {
 	}
 
 	/**
-	 * Specifies whether http status 301|302|307|308 auto-redirect support is enabled
+	 * Specifies whether HTTP status 301|302|307|308 auto-redirect support is enabled.
 	 *
-	 * @param followRedirect if true http status 301/302 auto-redirect support
-	 *                       is enabled otherwise disabled (default: true)
+	 * @param followRedirect if true HTTP status 301|302|307|308 auto-redirect support
+	 *                       is enabled, otherwise disabled (default: false).
 	 * @return a new {@link HttpClient}
 	 */
 	public final HttpClient followRedirect(boolean followRedirect) {
@@ -818,6 +819,42 @@ public abstract class HttpClient {
 			return tcpConfiguration(tcpClient -> tcpClient.bootstrap(
 			        b -> BootstrapHandlers.removeConfiguration(b, NettyPipeline.LoggingHandler)));
 		}
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link HttpClient}.
+	 * All generated metrics are registered in the Micrometer MeterRegistry,
+	 * assuming Micrometer is on the classpath.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the client.
+	 * @return a new {@link HttpClient}
+	 */
+	public final HttpClient metrics(boolean metricsEnabled) {
+		if (metricsEnabled) {
+			if (!Metrics.isInstrumentationAvailable()) {
+				throw new UnsupportedOperationException(
+						"To enable metrics, you must add the dependency `io.micrometer:micrometer-core`" +
+								" to the class path first");
+			}
+
+			return tcpConfiguration(tcpClient ->
+					tcpClient.bootstrap(b -> BootstrapHandlers.updateMetricsSupport(b, "reactor.netty.http.client", "http")));
+		}
+		else {
+			return tcpConfiguration(tcpClient -> tcpClient.bootstrap(BootstrapHandlers::removeMetricsSupport));
+		}
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link HttpClient}.
+	 * All generated metrics are provided to the specified recorder.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the server.
+	 * @param recorder the {@link HttpClientMetricsRecorder}
+	 * @return a new {@link HttpClient}
+	 */
+	public final HttpClient metrics(boolean metricsEnabled, HttpClientMetricsRecorder recorder) {
+		return tcpConfiguration(tcpClient -> tcpClient.metrics(metricsEnabled, recorder));
 	}
 
 	/**

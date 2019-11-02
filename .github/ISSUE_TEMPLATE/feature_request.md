@@ -2,23 +2,27 @@
 name: Feature request
 about: Suggest an idea for this project
 title: ''
-labels: enhancement
+labels: status/need-triage, type/enhancement
 assignees: ''
 
 ---
 
-### Following link https://pivotal.io/security should be used to report security related issues
+<!--- Provide a general summary of the issue in the Title above -->
 
-### [Gitter](https://gitter.im/reactor/reactor) should be used for questions and discussions
+<!--- /!\ Make sure to follow the Contribution Guidelines and notably for security issues:
+https://github.com/reactor/reactor-netty/blob/master/CONTRIBUTING.md
+https://pivotal.io/security
+-->
+<!--- /!\ Questions should be asked on [Gitter](https://gitter.im/reactor/reactor-netty) or [StackOverflow](https://stackoverflow.com/questions/tagged/reactor-netty). -->
 
-### Expected behavior
+## Motivation
+<!--- A clear and concise description of what the problem is. Ex. I'm always frustrated when [...] -->
 
-### Actual behavior
+## Desired solution
+<!--- A clear and concise description of what you want to happen. -->
 
-### Steps to reproduce
+## Considered alternatives
+<!--- A clear and concise description of any alternative solutions or features you've considered. -->
 
-### Reactor Netty version
-
-### JVM version (e.g. `java -version`)
-
-### OS version (e.g. `uname -a`)
+## Additional context
+<!--- Add any other context or screenshots about the feature request here. -->

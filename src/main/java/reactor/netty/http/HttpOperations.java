@@ -22,6 +22,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
@@ -73,10 +74,6 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 
 	protected HttpOperations(Connection connection, ConnectionObserver listener) {
 		super(connection, listener);
-		//reset channel to manual read if re-used
-		connection.channel()
-		          .config()
-		          .setAutoRead(false);
 	}
 
 	/**
@@ -266,6 +263,7 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 	 */
 	protected abstract HttpMessage outboundHttpMessage();
 
+	@SuppressWarnings("rawtypes")
 	final static AtomicIntegerFieldUpdater<HttpOperations> HTTP_STATE =
 			AtomicIntegerFieldUpdater.newUpdater(HttpOperations.class,
 					"statusAndHeadersSent");
@@ -335,18 +333,13 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 		}
 
 		@Override
-		public NettyOutbound options(Consumer<? super NettyPipeline.SendOptions> configurator) {
-			return parent.options(configurator);
+		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+			return parent.send(dataStream, predicate);
 		}
 
 		@Override
-		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream) {
-			return parent.send(dataStream);
-		}
-
-		@Override
-		public NettyOutbound sendObject(Publisher<?> dataStream) {
-			return parent.sendObject(dataStream);
+		public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
+			return parent.sendObject(dataStream, predicate);
 		}
 
 		@Override

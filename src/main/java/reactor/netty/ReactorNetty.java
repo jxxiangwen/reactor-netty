@@ -24,10 +24,12 @@ import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -44,6 +46,7 @@ import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCounted;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
+import reactor.core.CorePublisher;
 import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -406,7 +409,7 @@ public final class ReactorNetty {
 	}
 
 
-	static <T, V> Publisher<V> publisherOrScalarMap(Publisher<T> publisher,
+	static <T, V> CorePublisher<V> publisherOrScalarMap(Publisher<T> publisher,
 			Function<? super T, ? extends V> mapper) {
 
 		if (publisher instanceof Callable) {
@@ -534,19 +537,13 @@ public final class ReactorNetty {
 		}
 
 		@Override
-		public NettyOutbound options(Consumer<? super NettyPipeline.SendOptions> configurator) {
-			source.options(configurator);
-			return this;
+		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+			return then(source.send(dataStream, predicate));
 		}
 
 		@Override
-		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream) {
-			return then(source.send(dataStream));
-		}
-
-		@Override
-		public NettyOutbound sendObject(Publisher<?> dataStream) {
-			return then(source.sendObject(dataStream));
+		public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
+			return then(source.sendObject(dataStream, predicate));
 		}
 
 		@Override
@@ -726,12 +723,12 @@ public final class ReactorNetty {
 			}
 
 			@Override
-			public NettyOutbound send(Publisher<? extends ByteBuf> dataStream) {
+			public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
 				return this;
 			}
 
 			@Override
-			public NettyOutbound sendObject(Publisher<?> dataStream) {
+			public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
 				return this;
 			}
 
@@ -744,11 +741,6 @@ public final class ReactorNetty {
 			public <S> NettyOutbound sendUsing(Callable<? extends S> sourceInput,
 					BiFunction<? super Connection, ? super S, ?> mappedInput,
 					Consumer<? super S> sourceCleanup) {
-				return this;
-			}
-
-			@Override
-			public NettyOutbound options(Consumer<? super NettyPipeline.SendOptions> configurator) {
 				return this;
 			}
 
@@ -796,8 +788,14 @@ public final class ReactorNetty {
 	};
 
 
+	static final Predicate<ByteBuf>        PREDICATE_BB_FLUSH    = b -> false;
 
+	static final Predicate<Object>         PREDICATE_FLUSH       = o -> false;
 
+	static final ByteBuf                   BOUNDARY              = Unpooled.EMPTY_BUFFER;
 
+	@SuppressWarnings("ReferenceEquality")
+	//Design to use reference comparison here
+	public static final Predicate<ByteBuf> PREDICATE_GROUP_FLUSH = b -> b == BOUNDARY;
 
 }

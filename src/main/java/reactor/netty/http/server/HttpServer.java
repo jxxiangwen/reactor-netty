@@ -43,6 +43,7 @@ import reactor.netty.tcp.SslProvider;
 import reactor.netty.tcp.TcpServer;
 import reactor.util.Logger;
 import reactor.util.Loggers;
+import reactor.util.Metrics;
 
 /**
  * An HttpServer allows to build in a safe immutable way an HTTP server that is
@@ -243,13 +244,30 @@ public abstract class HttpServer {
 	 * Specifies whether support for the {@code "HAProxy proxy protocol"}
 	 * for deriving information about the address of the remote peer is enabled.
 	 *
-	 * @param proxyProtocolEnabled if true support for the {@code "HAProxy proxy protocol"}
-	 *                         for deriving information about the address of the remote peer is enabled,
-	 *                         otherwise disabled.
+	 * @param proxyProtocolSupportType
+	 *      <ul>
+	 *         <li>
+	 *             choose {@link ProxyProtocolSupportType#ON}
+	 *             to enable support for the {@code "HAProxy proxy protocol"}
+	 *             for deriving information about the address of the remote peer.
+	 *         </li>
+	 *         <li>choose {@link ProxyProtocolSupportType#OFF} to disable the proxy protocol support.</li>
+	 *         <li>
+	 *             choose {@link ProxyProtocolSupportType#AUTO}
+	 *             then each connection of the same {@link HttpServer} will auto detect whether there is proxy protocol,
+	 *             so {@link HttpServer} can accept requests with or without proxy protocol at the same time.
+	 *         </li>
+	 *      </ul>
+	 *
 	 * @return a new {@link HttpServer}
 	 */
-	public final HttpServer proxyProtocol(boolean proxyProtocolEnabled) {
-		if (proxyProtocolEnabled) {
+	public final HttpServer proxyProtocol(ProxyProtocolSupportType proxyProtocolSupportType) {
+		if (proxyProtocolSupportType == null) {
+			throw new NullPointerException("The parameter: proxyProtocolSupportType must not be null.");
+		}
+
+		if (proxyProtocolSupportType == ProxyProtocolSupportType.ON ||
+				proxyProtocolSupportType == ProxyProtocolSupportType.AUTO) {
 			if (!HAProxyMessageReader.hasProxyProtocol()) {
 				throw new UnsupportedOperationException(
 				        "To enable proxyProtocol, you must add the dependency `io.netty:netty-codec-haproxy`" +
@@ -260,17 +278,62 @@ public abstract class HttpServer {
 			        tcpServer.bootstrap(b -> BootstrapHandlers.updateConfiguration(b,
 			                NettyPipeline.ProxyProtocolDecoder,
 			                (connectionObserver, channel) -> {
-			                    channel.pipeline()
-			                           .addFirst(NettyPipeline.ProxyProtocolDecoder, new HAProxyMessageDecoder());
-			                    channel.pipeline()
-			                           .addAfter(NettyPipeline.ProxyProtocolDecoder,
-			                                     NettyPipeline.ProxyProtocolReader, new HAProxyMessageReader());
+			                    if (proxyProtocolSupportType == ProxyProtocolSupportType.ON) {
+			                        channel.pipeline()
+			                               .addFirst(NettyPipeline.ProxyProtocolDecoder, new HAProxyMessageDecoder())
+			                               .addAfter(NettyPipeline.ProxyProtocolDecoder,
+			                                         NettyPipeline.ProxyProtocolReader, new HAProxyMessageReader());
+			                    }
+			                    else { // AUTO
+			                        channel.pipeline()
+			                               .addFirst(NettyPipeline.ProxyProtocolDecoder, new HAProxyMessageDetector());
+			                    }
 			                })));
 		}
-		else {
+		else if (proxyProtocolSupportType == ProxyProtocolSupportType.OFF) {
 			return tcpConfiguration(tcpServer ->
 			        tcpServer.bootstrap(b -> BootstrapHandlers.removeConfiguration(b, NettyPipeline.ProxyProtocolDecoder)));
 		}
+		else {
+			//Will never be here
+			throw new IllegalArgumentException("Invalid proxyProtocolSupportType");
+		}
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link HttpServer}.
+	 * All generated metrics are registered in the Micrometer MeterRegistry,
+	 * assuming Micrometer is on the classpath.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the server.
+	 * @return a new {@link HttpServer}
+	 */
+	public final HttpServer metrics(boolean metricsEnabled) {
+		if (metricsEnabled) {
+			if (!Metrics.isInstrumentationAvailable()) {
+				throw new UnsupportedOperationException(
+						"To enable metrics, you must add the dependency `io.micrometer:micrometer-core`" +
+								" to the class path first");
+			}
+
+			return tcpConfiguration(tcpServer ->
+					tcpServer.bootstrap(b -> BootstrapHandlers.updateMetricsSupport(b, "reactor.netty.http.server", "http")));
+		}
+		else {
+			return tcpConfiguration(tcpServer -> tcpServer.bootstrap(BootstrapHandlers::removeMetricsSupport));
+		}
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link HttpServer}.
+	 * All generated metrics are provided to the specified recorder.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the server.
+	 * @param recorder the {@link HttpServerMetricsRecorder}
+	 * @return a new {@link HttpServer}
+	 */
+	public final HttpServer metrics(boolean metricsEnabled, HttpServerMetricsRecorder recorder) {
+		return tcpConfiguration(tcpServer -> tcpServer.metrics(metricsEnabled, recorder));
 	}
 
 	/**

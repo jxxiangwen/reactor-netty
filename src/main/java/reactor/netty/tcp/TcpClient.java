@@ -44,10 +44,12 @@ import reactor.netty.NettyInbound;
 import reactor.netty.NettyOutbound;
 import reactor.netty.NettyPipeline;
 import reactor.netty.channel.BootstrapHandlers;
+import reactor.netty.channel.ChannelMetricsRecorder;
 import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.resources.LoopResources;
 import reactor.util.Logger;
 import reactor.util.Loggers;
+import reactor.util.Metrics;
 
 import static reactor.netty.ReactorNetty.format;
 
@@ -514,6 +516,49 @@ public abstract class TcpClient {
 	@Nullable
 	public SslProvider sslProvider(){
 		return null;
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link TcpClient}.
+	 * All generated metrics are registered in the Micrometer MeterRegistry,
+	 * assuming Micrometer is on the classpath.
+	 * if {@code name} is {@code NULL} - {@code reactor.netty.tcp.client}
+	 * will be used as a name.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the client.
+	 * @return a new {@link TcpClient}
+	 */
+	public final TcpClient metrics(boolean metricsEnabled) {
+		if (metricsEnabled) {
+			if (!Metrics.isInstrumentationAvailable()) {
+				throw new UnsupportedOperationException(
+						"To enable metrics, you must add the dependency `io.micrometer:micrometer-core`" +
+								" to the class path first");
+			}
+
+			return bootstrap(b -> BootstrapHandlers.updateMetricsSupport(b, "reactor.netty.tcp.client", "tcp"));
+		}
+		else {
+			return bootstrap(BootstrapHandlers::removeMetricsSupport);
+		}
+	}
+
+	/**
+	 * Specifies whether the metrics are enabled on the {@link TcpClient}.
+	 * All generated metrics are provided to the specified recorder.
+	 *
+	 * @param metricsEnabled if true enables the metrics on the client.
+	 * @param recorder the {@link ChannelMetricsRecorder}
+	 * @return a new {@link TcpClient}
+	 */
+	public final TcpClient metrics(boolean metricsEnabled, ChannelMetricsRecorder recorder) {
+		if (metricsEnabled) {
+			Objects.requireNonNull(recorder, "recorder");
+			return bootstrap(b -> BootstrapHandlers.updateMetricsSupport(b, recorder));
+		}
+		else {
+			return bootstrap(BootstrapHandlers::removeMetricsSupport);
+		}
 	}
 
 	/**

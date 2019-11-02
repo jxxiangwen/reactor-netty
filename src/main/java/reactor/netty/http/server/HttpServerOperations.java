@@ -53,6 +53,7 @@ import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.cookie.Cookie;
 import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
 import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
+import io.netty.handler.codec.http2.HttpConversionUtil;
 import io.netty.util.AsciiString;
 import io.netty.util.ReferenceCountUtil;
 import org.reactivestreams.Publisher;
@@ -236,6 +237,10 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 		return get(channel()) instanceof WebsocketServerOperations;
 	}
 
+	boolean isHttp2() {
+		return requestHeaders().contains(HttpConversionUtil.ExtensionHeaderNames.SCHEME.text());
+	}
+
 	@Override
 	public HttpServerResponse keepAlive(boolean keepAlive) {
 		HttpUtil.setKeepAlive(nettyResponse, keepAlive);
@@ -308,12 +313,6 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 			return nettyRequest.headers();
 		}
 		throw new IllegalStateException("request not parsed");
-	}
-
-	@Override
-	public HttpServerOperations options(Consumer<? super NettyPipeline.SendOptions> configurator) {
-		super.options(configurator);
-		return this;
 	}
 
 	@Override
@@ -448,6 +447,9 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 			}
 			if (msg instanceof FullHttpRequest) {
 				super.onInboundNext(ctx, msg);
+				if (isHttp2()) {
+					onInboundComplete();
+				}
 			}
 			return;
 		}
@@ -516,7 +518,15 @@ class HttpServerOperations extends HttpOperations<HttpServerRequest, HttpServerR
 			return;
 		}
 
-		((HttpServerOperations)ops).terminate();
+		//Try to defer the disposing to leave a chance for any synchronous complete following this callback
+		if (!ops.isSubscriptionDisposed()) {
+			ch.eventLoop()
+			  .execute(((HttpServerOperations) ops)::terminate);
+		}
+		else {
+			//if already disposed, we can immediately call terminate
+			((HttpServerOperations) ops).terminate();
+		}
 	}
 
 	/**

@@ -15,41 +15,36 @@
  */
 package reactor.netty.http.server;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelDuplexHandler;
+import java.net.InetSocketAddress;
+import java.util.Optional;
+
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelPromise;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.socket.SocketChannel;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
 import io.netty.handler.codec.http.cookie.ServerCookieEncoder;
-import io.netty.handler.codec.http2.DefaultHttp2DataFrame;
-import io.netty.handler.codec.http2.DefaultHttp2HeadersFrame;
-import io.netty.handler.codec.http2.Http2DataFrame;
-import io.netty.handler.codec.http2.Http2Headers;
-import io.netty.handler.codec.http2.Http2HeadersFrame;
-import io.netty.handler.codec.http2.Http2StreamChannel;
-import io.netty.handler.codec.http2.HttpConversionUtil;
+import io.netty.handler.ssl.SslHandler;
 import reactor.netty.Connection;
 import reactor.netty.ConnectionObserver;
 
 import static reactor.netty.ReactorNetty.format;
 
-final class Http2StreamBridgeHandler extends ChannelDuplexHandler {
+final class Http2StreamBridgeHandler extends ChannelInboundHandlerAdapter {
 
-	final boolean            readForwardHeaders;
-	final boolean            secured;
-	final ConnectionObserver listener;
+	final boolean             readForwardHeaders;
+	Boolean                   secured;
+	InetSocketAddress         remoteAddress;
+	final ConnectionObserver  listener;
 	final ServerCookieEncoder cookieEncoder;
 	final ServerCookieDecoder cookieDecoder;
 
 	Http2StreamBridgeHandler(ConnectionObserver listener, boolean readForwardHeaders,
 			ServerCookieEncoder encoder,
-			ServerCookieDecoder decoder,
-			boolean secured) {
+			ServerCookieDecoder decoder) {
 		this.readForwardHeaders = readForwardHeaders;
 		this.listener = listener;
 		this.cookieEncoder = encoder;
-		this.secured = secured;
 		this.cookieDecoder = decoder;
 	}
 
@@ -63,55 +58,32 @@ final class Http2StreamBridgeHandler extends ChannelDuplexHandler {
 	}
 
 	@Override
-	public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-		if (msg instanceof Http2HeadersFrame) {
-			Http2HeadersFrame headersFrame = (Http2HeadersFrame)msg;
-			HttpRequest request;
-			if (headersFrame.isEndStream()) {
-				request = HttpConversionUtil.toFullHttpRequest(-1,
-						headersFrame.headers(),
-						ctx.channel().alloc(),
-						false);
-			}
-			else {
-				request = HttpConversionUtil.toHttpRequest(-1,
-								headersFrame.headers(),
-								false);
-			}
-			HttpToH2Operations ops = new HttpToH2Operations(Connection.from(ctx.channel()),
+	public void channelRead(ChannelHandlerContext ctx, Object msg) {
+		if (secured == null) {
+			secured = ctx.channel().pipeline().get(SslHandler.class) != null;
+		}
+		if (remoteAddress == null) {
+			remoteAddress =
+					Optional.ofNullable(HAProxyMessageReader.resolveRemoteAddressFromProxyProtocol(ctx.channel().parent()))
+					        .orElse(((SocketChannel) ctx.channel().parent()).remoteAddress());
+		}
+		if (msg instanceof HttpRequest) {
+			HttpRequest request = (HttpRequest) msg;
+			HttpServerOperations ops = new HttpServerOperations(Connection.from(ctx.channel()),
 					listener,
+					null,
 					request,
-					headersFrame.headers(),
-					ConnectionInfo.from(ctx.channel()
-					                       .parent(),
-							readForwardHeaders,
-							request,
-							secured),
-					cookieEncoder, cookieDecoder);
+					ConnectionInfo.from(ctx.channel().parent(),
+					                    readForwardHeaders,
+					                    request,
+					                    secured,
+					                    remoteAddress),
+					cookieEncoder,
+					cookieDecoder);
 			ops.bind();
 			listener.onStateChange(ops, ConnectionObserver.State.CONFIGURED);
 		}
 		ctx.fireChannelRead(msg);
-	}
-
-	@Override
-	public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-		if (msg instanceof Http2Headers) {
-			msg = new DefaultHttp2HeadersFrame((Http2Headers) msg);
-		}
-
-		boolean endOfHttp2Stream = false;
-		if (msg instanceof Http2DataFrame) {
-			endOfHttp2Stream = ((Http2DataFrame) msg).isEndStream();
-		}
-
-
-		if (!endOfHttp2Stream && msg instanceof ByteBuf &&
-				ctx.channel() instanceof Http2StreamChannel) {
-			msg = new DefaultHttp2DataFrame((ByteBuf) msg);
-		}
-
-		ctx.write(msg, promise);
 	}
 
 }

@@ -244,19 +244,20 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 	@Override
 	protected void onInboundClose() {
 		if (isInboundCancelled() || isInboundDisposed()) {
+			listener().onStateChange(this, ConnectionObserver.State.DISCONNECTING);
 			return;
 		}
 		listener().onStateChange(this, HttpClientState.RESPONSE_INCOMPLETE);
 		if (responseState == null) {
 			if (markSentBody()) {
-				listener().onUncaughtException(this, PrematureCloseException.BEFORE_RESPONSE_SENDING_REQUEST);
+				listener().onUncaughtException(this, new PrematureCloseException("Connection has been closed BEFORE response, while sending request body"));
 			}
 			else {
-				listener().onUncaughtException(this, PrematureCloseException.BEFORE_RESPONSE);
+				listener().onUncaughtException(this, new PrematureCloseException("Connection prematurely closed BEFORE response"));
 			}
 			return;
 		}
-		super.onInboundError(PrematureCloseException.DURING_RESPONSE);
+		super.onInboundError(new PrematureCloseException("Connection prematurely closed DURING response"));
 	}
 
 	@Override
@@ -768,7 +769,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 	}
 
 	static final int                    MAX_REDIRECTS      = 50;
-	@SuppressWarnings("unchecked")
+	@SuppressWarnings({"unchecked","rawtypes"})
 	static final Supplier<String>[]     EMPTY_REDIRECTIONS = (Supplier<String>[])new Supplier[0];
 	static final Logger                 log                = Loggers.getLogger(HttpClientOperations.class);
 }
